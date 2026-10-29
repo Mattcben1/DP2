@@ -1,0 +1,143 @@
+version: 2
+
+models:
+  - name: fct_pull_requests
+    description: >
+      One row per PR created on or after the window start, with precalculated flags and durations.
+      PRs still open at run time are kept with is_open = true and NULL merge/close durations.
+      "Counted" reviews exclude reviews by the PR author and by bots.
+    columns:
+      - name: repo
+        description: Repository as owner/name.
+        tests: [not_null]
+      - name: pr_key
+        description: Primary key, repo || '#' || number.
+        tests: [unique, not_null]
+      - name: number
+        description: PR number within the repo.
+      - name: author_login
+        description: GitHub login of the PR author.
+      - name: author_is_bot
+        description: True when the PR author matches the bot rule.
+      - name: state
+        description: open or closed at fetch time.
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['open', 'closed']
+      - name: created_at
+        description: When the PR was opened, UTC.
+      - name: updated_at
+        description: Last activity on the PR, UTC.
+      - name: closed_at
+        description: When the PR was closed (merged or not); NULL while open.
+      - name: merged_at
+        description: When the PR was merged; NULL unless merged.
+      - name: is_merged
+        description: merged_at IS NOT NULL.
+      - name: is_closed_unmerged
+        description: state = 'closed' AND merged_at IS NULL.
+      - name: is_open
+        description: state = 'open' (open at run time).
+      - name: first_review_at
+        description: Earliest counted review (not by the author, not by a bot); NULL if never reviewed.
+      - name: hours_to_first_review
+        description: Hours from created_at to first_review_at; NULL if never reviewed.
+      - name: reviewed_within_7d
+        description: hours_to_first_review <= 168; false if never reviewed.
+      - name: hours_to_merge
+        description: Hours from created_at to merged_at; NULL unless merged.
+      - name: hours_to_close
+        description: Hours from created_at to closed_at, merged or not; NULL if open.
+      - name: is_stale
+        description: Open and no activity (updated_at) in the 180 days before run time.
+      - name: has_approving_review
+        description: Any counted review with state = 'APPROVED'.
+
+  - name: fct_releases
+    description: >
+      One row per published release on or after the window start. days_since_previous is computed
+      over all releases before filtering, so the first in-window release still has a gap.
+    columns:
+      - name: repo
+        description: Repository as owner/name.
+        tests: [not_null]
+      - name: release_id
+        description: Release id (primary key).
+        tests: [unique, not_null]
+      - name: tag_name
+        description: Git tag of the release.
+      - name: published_at
+        description: When the release was published, UTC.
+      - name: is_prerelease
+        description: True for release candidates / betas.
+      - name: days_since_previous
+        description: Days since the repo's previous release; NULL only for a repo's first-ever release.
+
+  - name: mart_repo_monthly
+    description: >
+      Repo x month from the window start through the run month, built on a date spine so months
+      with no activity show 0. Each PR event is counted in the month it happened.
+    columns:
+      - name: repo_month_key
+        description: Primary key, repo || '|' || YYYY-MM.
+        tests: [unique, not_null]
+      - name: repo
+        description: Repository as owner/name.
+        tests: [not_null]
+      - name: month
+        description: First instant of the month, UTC.
+        tests: [not_null]
+      - name: month_index
+        description: 0 for the window's first month, counting up; the x variable for trend slopes.
+      - name: prs_opened
+        description: PRs created this month.
+      - name: prs_merged
+        description: PRs merged this month (by merged_at).
+      - name: prs_closed_unmerged
+        description: PRs closed without merging this month (by closed_at).
+      - name: merge_ratio
+        description: prs_merged / (prs_merged + prs_closed_unmerged); NULL when no PRs were closed.
+      - name: median_first_review_hours
+        description: Median hours_to_first_review of PRs opened this month; never-reviewed PRs fall out.
+      - name: median_merge_hours
+        description: Median hours_to_merge of PRs merged this month.
+      - name: commits
+        description: Commits this month (by committed_at).
+      - name: active_contributors
+        description: Distinct non-bot authors who opened a PR this month.
+      - name: is_partial_month
+        description: True for the run month, which is not yet complete.
+
+  - name: mart_health_inputs
+    description: >
+      One row per repo with one column per candidate health metric for Task 5. Every column is a
+      rate, share, median, coefficient of variation, or slope, never a raw count.
+    columns:
+      - name: repo
+        description: Repository as owner/name.
+        tests: [unique, not_null]
+      - name: commits_per_week
+        description: "Activity, higher is healthier: commits in window / (window days / 7)."
+      - name: commits_per_active_author_per_week
+        description: "Activity, size-neutral, higher is healthier: commits_per_week / active_authors_per_month."
+      - name: commit_trend_pct
+        description: "Activity trend, higher is healthier: regr_slope(commits, month_index) / mean monthly commits, complete months only. Fractional change per month."
+      - name: median_hours_to_first_review
+        description: "Responsiveness, lower is healthier: median hours_to_first_review; unreviewed PRs excluded."
+      - name: pct_reviewed_within_7d
+        description: "Responsiveness, higher is healthier: share of PRs at least 7 days old reviewed within 7 days."
+      - name: merge_rate
+        description: "Throughput, higher is healthier: merged / (merged + closed unmerged); open PRs excluded."
+      - name: median_hours_to_merge
+        description: "Throughput, lower is healthier: median hours_to_merge of merged PRs; open PRs excluded."
+      - name: pct_merged_with_approval
+        description: "Review quality, higher is healthier: share of merged PRs with a counted approving review."
+      - name: pct_open_stale
+        description: "Backlog, lower is healthier: share of open PRs with no activity in 180+ days."
+      - name: releases_per_year
+        description: "Release cadence, higher is healthier: releases in window / (window days / 365.25)."
+      - name: release_interval_cv
+        description: "Release regularity, lower is healthier: stddev / mean of days_since_previous."
+      - name: active_authors_per_month
+        description: "Contributor base, higher is healthier: mean monthly distinct non-bot PR authors, complete months only."

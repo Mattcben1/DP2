@@ -13,6 +13,7 @@ import pandas as pd
 from prefect import flow, task, get_run_logger
 from prefect.cache_policies import NO_CACHE
 from prefect.tasks import exponential_backoff
+from prefect_dbt import PrefectDbtRunner, PrefectDbtSettings
 
 # ---------- Config ----------
 DEV_MODE = False  # flip to False for the full run (the one-line change)
@@ -474,11 +475,33 @@ def load() -> dict:
     return counts
 
 
-@task(name="3-dbt-build")
+@task(name="3-dbt-build", cache_policy=NO_CACHE)
 def dbt_build() -> dict:
+    """Task 3: run `dbt build` (models + tests); fail the flow if any node fails."""
     log = TaskLog("dbt_build")
-    log.info("STUB dbt_build: project_dir=%s", DBT_DIR.name)
-    return {}
+    os.environ["DP2_DB_PATH"] = str(DB_PATH)  # profiles.yml reads this, so cwd doesn't matter
+    runner = PrefectDbtRunner(
+        settings=PrefectDbtSettings(project_dir=DBT_DIR, profiles_dir=DBT_DIR),
+        raise_on_failure=False,  # we log every result to our own file first, then raise below
+    )
+    dbt_vars = json.dumps({"window_start": START_DATE})
+    log.info("Running dbt build with vars %s", dbt_vars)
+    res = runner.invoke(["build", "--vars", dbt_vars])
+
+    statuses = {}
+    failed = []
+    for r in res.result.results:
+        status = str(r.status)
+        statuses[status] = statuses.get(status, 0) + 1
+        log.info("%-5s %s %s (failures=%s)", status.upper(), r.node.resource_type, r.node.name, r.failures)
+        if status in ("error", "fail"):
+            failed.append(f"{r.node.name}: {r.message}")
+
+    log.info("dbt build finished: %s", statuses)
+    if not res.success:
+        log.error("dbt build failed on %d node(s)", len(failed))
+        raise RuntimeError("dbt build failed:\n" + "\n".join(failed))
+    return statuses
 
 
 @task(name="4-validate")

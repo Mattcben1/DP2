@@ -2,6 +2,10 @@ package_health:
   outputs:
     dev:
       type: duckdb
-      path: packages.duckdb
+      # main.py sets DP2_DB_PATH to an absolute path; the default works when run by hand from the repo root
+      path: "{{ env_var('DP2_DB_PATH', 'packages.duckdb') }}"
       threads: 1
+      settings:
+        # GitHub timestamps are UTC; without this, date_trunc('month') uses the laptop's local zone
+        TimeZone: UTC
   target: dev

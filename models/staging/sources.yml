@@ -1,0 +1,17 @@
+version: 2
+
+sources:
+  - name: raw
+    description: >
+      Raw tables written by Task 2 (load) into packages.duckdb. One row per GitHub record,
+      primary key (repo, id), with the full API record kept in `payload` (JSON).
+    schema: main
+    tables:
+      - name: raw_commits
+        description: One row per commit. id = commit sha.
+      - name: raw_pull_requests
+        description: One row per pull request. id = PR number (unique only within a repo).
+      - name: raw_pr_reviews
+        description: One row per PR review. id = review id.
+      - name: raw_releases
+        description: One row per release. id = release id.

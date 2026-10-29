@@ -1,0 +1,113 @@
+version: 2
+
+# Bot rule (applied to commit authors, PR authors, and reviewers):
+#   is_bot = user.type = 'Bot' OR user.login LIKE '%[bot]'
+# coalesced to false, so a commit with no linked GitHub account is not a bot.
+# Every staging model keeps the latest row per (repo, id) by fetched_at and casts timestamps to TIMESTAMPTZ (UTC).
+
+models:
+  - name: stg_commits
+    description: One row per commit, typed from raw_commits.payload.
+    columns:
+      - name: repo
+        description: Repository as owner/name.
+        tests: [not_null]
+      - name: sha
+        description: Commit SHA (primary key).
+        tests: [unique, not_null]
+      - name: author_login
+        description: GitHub login of the commit author; null when the commit email isn't linked to an account.
+      - name: author_is_bot
+        description: True when the author matches the bot rule; false when the author is null.
+        tests: [not_null]
+      - name: committed_at
+        description: Author date of the commit (commit.author.date), UTC.
+        tests: [not_null]
+
+  - name: stg_pull_requests
+    description: One row per pull request, typed from raw_pull_requests.payload.
+    columns:
+      - name: repo
+        description: Repository as owner/name.
+        tests: [not_null]
+      - name: pr_key
+        description: Primary key, repo || '#' || number (PR numbers repeat across repos).
+        tests: [unique, not_null]
+      - name: number
+        description: PR number within the repo.
+        tests: [not_null]
+      - name: author_login
+        description: GitHub login of the PR author.
+      - name: author_is_bot
+        description: True when the PR author matches the bot rule.
+        tests: [not_null]
+      - name: state
+        description: open or closed at fetch time (merged PRs are closed with a merged_at).
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['open', 'closed']
+      - name: created_at
+        description: When the PR was opened, UTC.
+        tests: [not_null]
+      - name: updated_at
+        description: Last activity on the PR, UTC.
+      - name: closed_at
+        description: When the PR was closed (merged or not); null while open.
+      - name: merged_at
+        description: When the PR was merged; null unless merged.
+
+  - name: stg_pr_reviews
+    description: One row per submitted PR review (PENDING drafts dropped), typed from raw_pr_reviews.payload.
+    columns:
+      - name: repo
+        description: Repository as owner/name.
+        tests: [not_null]
+      - name: review_id
+        description: Review id (primary key).
+        tests: [unique, not_null]
+      - name: pr_key
+        description: The reviewed PR, repo || '#' || pr_number; must exist in stg_pull_requests.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_pull_requests')
+                field: pr_key
+      - name: pr_number
+        description: PR number parsed from the trailing digits of pull_request_url.
+        tests: [not_null]
+      - name: reviewer_login
+        description: GitHub login of the reviewer.
+      - name: reviewer_is_bot
+        description: True when the reviewer matches the bot rule.
+        tests: [not_null]
+      - name: state
+        description: Review verdict.
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED']
+      - name: submitted_at
+        description: When the review was submitted, UTC.
+        tests: [not_null]
+
+  - name: stg_releases
+    description: One row per published (non-draft) release, typed from raw_releases.payload.
+    columns:
+      - name: repo
+        description: Repository as owner/name.
+        tests: [not_null]
+      - name: release_id
+        description: Release id (primary key).
+        tests: [unique, not_null]
+      - name: tag_name
+        description: Git tag of the release, e.g. v1.5.0.
+      - name: published_at
+        description: When the release was published, UTC.
+        tests: [not_null]
+      - name: is_prerelease
+        description: True for release candidates / betas.
+        tests: [not_null]
