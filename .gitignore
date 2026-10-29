@@ -1,3 +1,18 @@
 storage*
 github*
 CLAUDE.md
+.claude/settings.local.json
+
+# environment
+.venv/
+__pycache__/
+
+# pipeline outputs (never commit)
+data/
+*.duckdb
+*.duckdb.wal
+logs/
+
+# dbt artifacts
+target/
+dbt_packages/
