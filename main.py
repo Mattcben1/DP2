@@ -15,7 +15,7 @@ from prefect.cache_policies import NO_CACHE
 from prefect.tasks import exponential_backoff
 
 # ---------- Config ----------
-DEV_MODE = True  # flip to False for the full run (the one-line change)
+DEV_MODE = False  # flip to False for the full run (the one-line change)
 
 FULL_START_DATE = "2024-01-01"
 DEV_START_DATE = "2026-01-01"
