@@ -16,3 +16,4 @@ logs/
 # dbt artifacts
 target/
 dbt_packages/
+.user.yml
