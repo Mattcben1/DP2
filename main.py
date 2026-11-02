@@ -4,19 +4,28 @@ import logging
 import os
 import shutil
 import time
-from datetime import datetime, timezone
+import warnings
+from datetime import UTC, datetime
 from pathlib import Path
 
 import duckdb
 import httpx
 import pandas as pd
-from prefect import flow, task, get_run_logger
+from pandas.errors import Pandas4Warning
+from prefect import flow, get_run_logger, task
 from prefect.cache_policies import NO_CACHE
 from prefect.tasks import exponential_backoff
 from prefect_dbt import PrefectDbtRunner, PrefectDbtSettings
 
+# DuckDB's .df() calls DataFrame.drop(inplace=True) internally when converting TIMESTAMPTZ
+# columns; pandas 3.1 deprecates that. It's DuckDB-internal (our code never uses inplace=).
+# Filtered by category + exact message, not module: Python attributes the warning to OUR
+# calling line, so module="duckdb" would not match.
+warnings.filterwarnings("ignore", category=Pandas4Warning,
+                        message=r"The inplace keyword in DataFrame\.drop")
+
 # ---------- Config ----------
-DEV_MODE = False  # flip to False for the full run (the one-line change)
+DEV_MODE = False  # True = dev run (2026-01-01, dask only); False = full run. The one-line change.
 
 FULL_START_DATE = "2024-01-01"
 DEV_START_DATE = "2026-01-01"
@@ -79,12 +88,12 @@ class TaskLog:
 def _iso(ts: datetime) -> str:
     """Format a timestamp the way GitHub does: 2026-01-01T00:00:00Z (UTC)."""
     if ts.tzinfo is not None:
-        ts = ts.astimezone(timezone.utc)
+        ts = ts.astimezone(UTC)
     return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _utc_now() -> str:
-    return _iso(datetime.now(timezone.utc))
+    return _iso(datetime.now(UTC))
 
 
 # ---------- Task 1 helpers: HTTP ----------
@@ -98,7 +107,7 @@ def _retry_if_transient(task, task_run, state) -> bool:
         state.result()
     except TransientHTTPError:
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001 - any non-transient error must not be retried
         return False
     return False
 
@@ -449,7 +458,7 @@ def load() -> dict:
         log.info("%s: read %d files, %d records, %d unique records", endpoint, n_files, n_records, len(df))
 
     counts = {}
-    loaded_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    loaded_at = datetime.now(UTC).replace(tzinfo=None)
     try:
         with duckdb.connect(str(DB_PATH)) as con:
             for spec in RAW_TABLES.values():
@@ -506,6 +515,37 @@ def dbt_build() -> dict:
         log.error("dbt build failed on %d node(s)", len(failed))
         raise RuntimeError("dbt build failed:\n" + "\n".join(failed))
     return statuses
+
+
+# ---------- Tasks 4-5 shared helpers ----------
+def _connect_db(log: TaskLog) -> duckdb.DuckDBPyConnection:
+    """Open packages.duckdb for Tasks 4-5, in UTC like dbt's session.
+
+    Not read_only: dbt-duckdb keeps its read-write connection open in this same process, and
+    DuckDB refuses a second connection to the same file with a different configuration.
+    """
+    try:
+        con = duckdb.connect(str(DB_PATH))
+    except duckdb.IOException as exc:
+        if "lock" in str(exc).lower():
+            log.error("%s is locked: the DuckDB CLI (or another process) may have it open. "
+                      "Close it and rerun.", DB_PATH.name)
+        raise
+    try:
+        con.execute("SET TimeZone = 'UTC'")  # same session zone as dbt, so week buckets line up
+    except Exception:
+        con.close()  # the caller's `with` hasn't started yet, so close it here
+        raise
+    return con
+
+
+def _show_table(log: TaskLog, title: str, df: pd.DataFrame, index: bool = False) -> None:
+    """Print a table to the screen and write the same lines to the Prefect logger and log file."""
+    table = df.to_string(index=index)
+    print(f"{title}\n{table}")
+    log.info("%s", title)
+    for line in table.splitlines():
+        log.info("  %s", line)
 
 
 # ---------- Task 4 helpers ----------
@@ -625,8 +665,9 @@ def _find_outliers(con, log: TaskLog) -> dict:
     """Outlier scan of time to merge and weekly commits. Flagged records are logged and kept."""
     # Run time = newest fetched_at, the same definition dbt uses, so reruns on the same data agree.
     run_time = con.execute("SELECT max(fetched_at)::TIMESTAMPTZ FROM raw_commits").fetchall()[0][0]
-    log.info("Outlier rules (upper side only): merge time > %d days; weekly commits > Q3 + %.0f*IQR "
-             "per repo. Run time = %s", SLOW_MERGE_DAYS, OUTLIER_IQR_K, run_time)
+    log.info("Outlier rules (upper side only): merge time > %d days (fixed, all repos); weekly commits "
+             "> Q3 + %.0f*IQR per repo on RAW weekly counts (no log transform). Run time = %s",
+             SLOW_MERGE_DAYS, OUTLIER_IQR_K, run_time)
 
     # Series 1: hours to merge, read from the fact table (not recomputed); title only for the report.
     merges = con.execute("""
@@ -687,7 +728,8 @@ def _find_outliers(con, log: TaskLog) -> dict:
         summary[repo] = {"slow_merges": len(repo_slow), "burst_weeks": len(repo_bursts)}
 
     log.info("Decision: flagged records are KEPT (not capped or dropped). They are real events, "
-             "not data errors; Task 5 uses medians and rates that are robust to them.")
+             "not data errors. Task 5's merge metric is a median, so slow merges barely move it; "
+             "commit bursts do feed commit_trend_pct (a regression slope), noted in the README.")
     return summary
 
 
@@ -711,11 +753,7 @@ def _describe(con, log: TaskLog) -> pd.DataFrame:
         ORDER BY f.repo
     """).df().round(1)
 
-    table = stats.to_string(index=False)
-    print(table)
-    log.info("Descriptive statistics (hours; PRs created in window):")
-    for line in table.splitlines():
-        log.info("  %s", line)
+    _show_table(log, "Descriptive statistics (hours; PRs created in window):", stats)
     return stats
 
 
@@ -723,19 +761,7 @@ def _describe(con, log: TaskLog) -> pd.DataFrame:
 def validate() -> dict:
     """Task 4 (Python, no dbt): end-to-end completeness checks, outlier scan, descriptive stats."""
     log = TaskLog("validate")
-    try:
-        # Not read_only: dbt-duckdb keeps its read-write connection open in this same process, and
-        # DuckDB refuses a second connection to the same file with a different configuration.
-        # This task still only runs SELECTs.
-        con = duckdb.connect(str(DB_PATH))
-    except duckdb.IOException as exc:
-        if "lock" in str(exc).lower():
-            log.error("%s is locked: the DuckDB CLI (or another process) may have it open. "
-                      "Close it and rerun.", DB_PATH.name)
-        raise
-
-    with con:
-        con.execute("SET TimeZone = 'UTC'")  # same session zone as dbt, so week buckets line up
+    with _connect_db(log) as con:  # this task only runs SELECTs
         failures = (_check_files_in_raw(con, log)
                     + _check_raw_vs_staging(con, log)
                     + _check_monthly_commits(con, log))
@@ -750,11 +776,129 @@ def validate() -> dict:
     return {"outliers": outliers, "stats": stats.to_dict(orient="records")}
 
 
+# ---------- Task 5 helpers ----------
+# Metric in mart_health_inputs -> (dimension, direction): +1 = higher is healthier, -1 = lower is.
+HEALTH_METRICS = {
+    "commit_trend_pct": ("activity_trend", +1),
+    "median_hours_to_first_review": ("responsiveness", -1),
+    "pct_reviewed_within_7d": ("responsiveness", +1),
+    "merge_rate": ("throughput", +1),
+    "median_hours_to_merge": ("throughput", -1),
+    "pct_open_stale": ("backlog", -1),
+    "releases_per_year": ("release_cadence", +1),
+    "release_interval_cv": ("release_cadence", -1),
+}
+
+# Fixed before looking at the scores and not tuned to them (reasoning in the README).
+DIMENSION_WEIGHTS = {
+    "activity_trend": 0.25,
+    "responsiveness": 0.25,
+    "throughput": 0.20,
+    "backlog": 0.15,
+    "release_cadence": 0.15,
+}
+
+
+def _check_model_config(columns) -> None:
+    """Raise on structural config errors. These are bugs in the setup, not problems in the data."""
+    dimensions = {dim for dim, _ in HEALTH_METRICS.values()}
+    problems = []
+    if abs(sum(DIMENSION_WEIGHTS.values()) - 1) > 1e-9:
+        problems.append(f"weights sum to {sum(DIMENSION_WEIGHTS.values()):.3f}, not 1")
+    if len(HEALTH_METRICS) < 4:
+        problems.append(f"only {len(HEALTH_METRICS)} metrics; at least 4 are required")
+    if len(dimensions) < 3:
+        problems.append(f"only {len(dimensions)} dimensions; at least 3 are required")
+    if dimensions != set(DIMENSION_WEIGHTS):
+        problems.append(f"metric dimensions {sorted(dimensions)} != weighted dimensions "
+                        f"{sorted(DIMENSION_WEIGHTS)}")
+    bad_direction = [m for m, (_, d) in HEALTH_METRICS.items() if d not in (1, -1)]
+    if bad_direction:
+        problems.append(f"direction must be +1 or -1 for {bad_direction}")
+    missing = sorted(set(HEALTH_METRICS) - set(columns))
+    if missing:
+        problems.append(f"columns missing from mart_health_inputs: {missing}")
+    if problems:
+        raise ValueError("Invalid Task 5 config: " + "; ".join(problems))
+
+
+def _signed_zscores(inputs: pd.DataFrame, log: TaskLog) -> pd.DataFrame:
+    """Per metric: z-score across repos, times its direction, so higher is always healthier.
+
+    Population sd (ddof=0): the repos compared are the whole population, not a sample.
+    A NULL value gets z = 0 (neutral) with a warning; a metric with no spread gives everyone 0.
+    """
+    z = pd.DataFrame(index=inputs.index)
+    for metric, (_, direction) in HEALTH_METRICS.items():
+        x = inputs[metric].astype(float)
+        for repo in x[x.isna()].index:
+            log.warning("%s: %s is NULL; its z-score is set to 0 (neutral)", repo, metric)
+        sd = x.std(ddof=0)  # pandas skips NULLs in mean and sd
+        if pd.isna(sd) or sd == 0:
+            z[metric] = 0.0
+        else:
+            z[metric] = (direction * (x - x.mean()) / sd).fillna(0.0)
+    return z
+
+
+def _rank(z: pd.DataFrame, weights: dict) -> pd.DataFrame:
+    """Dimension subscore = mean signed z of its metrics; score = weighted sum; rank 1 = healthiest."""
+    ranked = pd.DataFrame({
+        dim: z[[m for m, (d, _) in HEALTH_METRICS.items() if d == dim]].mean(axis=1)
+        for dim in weights
+    })
+    ranked["score"] = sum(ranked[dim] * w for dim, w in weights.items())
+    ranked["rank"] = ranked["score"].rank(ascending=False, method="min").astype(int)
+    return ranked.sort_values("rank")
+
+
+def _weight_sensitivity(z: pd.DataFrame, log: TaskLog) -> dict:
+    """Log the ranking under the chosen weights, equal weights, and each dimension dropped in turn."""
+    scenarios = {
+        "chosen weights": DIMENSION_WEIGHTS,
+        "equal weights": {dim: 1 / len(DIMENSION_WEIGHTS) for dim in DIMENSION_WEIGHTS},
+    }
+    for dropped in DIMENSION_WEIGHTS:
+        rest = {dim: w for dim, w in DIMENSION_WEIGHTS.items() if dim != dropped}
+        scenarios[f"drop {dropped}"] = {dim: w / sum(rest.values()) for dim, w in rest.items()}
+
+    log.info("Weight sensitivity (repos healthiest first, score in brackets):")
+    orders = {}
+    for name, weights in scenarios.items():
+        ranked = _rank(z, weights)
+        orders[name] = list(ranked.index)
+        log.info("  %-24s %s", name,
+                 "  >  ".join(f"{repo} ({score:+.2f})" for repo, score in ranked["score"].items()))
+    same = sum(order == orders["chosen weights"] for name, order in orders.items() if name != "chosen weights")
+    log.info("The chosen-weights ranking holds in %d of %d alternative scenarios", same, len(orders) - 1)
+    return orders
+
+
 @task(name="5-model")
 def model() -> dict:
+    """Task 5: composite health score from mart_health_inputs; ranked table to screen, log, and DB."""
     log = TaskLog("model")
-    log.info("STUB model")
-    return {}
+    with _connect_db(log) as con:
+        inputs = con.execute("SELECT * FROM mart_health_inputs ORDER BY repo").df().set_index("repo")
+        _check_model_config(inputs.columns)
+
+        z = _signed_zscores(inputs, log)
+        ranking = _rank(z, DIMENSION_WEIGHTS)
+        dims = list(DIMENSION_WEIGHTS)
+        _show_table(log, "Health ranking (dimension subscores = mean signed z; score = weighted sum):",
+                    ranking[["rank", "score", *dims]].round(2), index=True)
+        _show_table(log, "Signed z-scores per metric (positive = healthier than the group average):",
+                    z.T.round(2), index=True)
+        sensitivity = _weight_sensitivity(z, log)
+
+        out = ranking.reset_index()[["repo", "rank", "score", *dims]]
+        out["scored_at"] = datetime.now(UTC).replace(tzinfo=None)
+        con.register("ranking_df", out)
+        con.execute("CREATE OR REPLACE TABLE health_ranking AS SELECT * FROM ranking_df")
+        con.unregister("ranking_df")
+        log.info("Wrote %d rows to health_ranking", len(out))
+
+    return {"ranking": out.drop(columns="scored_at").to_dict(orient="records"), "sensitivity": sensitivity}
 
 
 @task(name="6-plot")

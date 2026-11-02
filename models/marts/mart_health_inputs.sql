@@ -1,6 +1,8 @@
 -- One row per repo, one column per candidate Task 5 metric.
--- Every column is a rate, share, median, CV, or slope (never a raw count), so big repos
--- don't win on volume alone.
+-- Every column is a rate, share, median, CV, or slope, never a raw total. Most are also
+-- size-neutral; the exceptions are commits_per_week and active_authors_per_month (they grow with
+-- project size, so Task 5 doesn't score them) and releases_per_year (a count rate, but release
+-- count follows a project's release policy, not its number of contributors).
 with window_len as (
     select date_diff('second', {{ window_start() }}, {{ run_time() }}) / 86400.0 as days
 ),
@@ -34,12 +36,15 @@ monthly_metrics as (
     group by repo
 ),
 
+-- Stable releases only: pre-releases (RCs, betas) would inflate the count and add short gaps.
 release_metrics as (
     select
         repo,
         count(*)                                                    as releases_in_window,
-        stddev_samp(days_since_previous) / nullif(avg(days_since_previous), 0) as release_interval_cv
+        stddev_samp(days_since_previous_stable)
+            / nullif(avg(days_since_previous_stable), 0)            as release_interval_cv
     from {{ ref('fct_releases') }}
+    where not is_prerelease
     group by repo
 )
 

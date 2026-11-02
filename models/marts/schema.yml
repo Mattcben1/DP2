@@ -73,6 +73,10 @@ models:
         description: True for release candidates / betas.
       - name: days_since_previous
         description: Days since the repo's previous release; NULL only for a repo's first-ever release.
+      - name: days_since_previous_stable
+        description: >
+          Days since the repo's previous stable (non-pre-release) release, skipping pre-releases;
+          NULL for pre-releases and for a repo's first-ever stable release. Used for release_interval_cv.
 
   - name: mart_repo_monthly
     description: >
@@ -112,7 +116,9 @@ models:
   - name: mart_health_inputs
     description: >
       One row per repo with one column per candidate health metric for Task 5. Every column is a
-      rate, share, median, coefficient of variation, or slope, never a raw count.
+      rate, share, median, coefficient of variation, or slope, never a raw total. Not all are
+      size-neutral: commits_per_week and active_authors_per_month grow with project size.
+      Release metrics count stable releases only (pre-releases excluded).
     columns:
       - name: repo
         description: Repository as owner/name.
@@ -136,8 +142,8 @@ models:
       - name: pct_open_stale
         description: "Backlog, lower is healthier: share of open PRs with no activity in 180+ days."
       - name: releases_per_year
-        description: "Release cadence, higher is healthier: releases in window / (window days / 365.25)."
+        description: "Release cadence, higher is healthier: stable releases in window / (window days / 365.25). A count rate; release count follows release policy, not contributor volume."
       - name: release_interval_cv
-        description: "Release regularity, lower is healthier: stddev / mean of days_since_previous."
+        description: "Release regularity, lower is healthier: stddev / mean of days_since_previous_stable (stable releases only)."
       - name: active_authors_per_month
         description: "Contributor base, higher is healthier: mean monthly distinct non-bot PR authors, complete months only."
