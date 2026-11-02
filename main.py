@@ -10,7 +10,12 @@ from pathlib import Path
 
 import duckdb
 import httpx
+import matplotlib
 import pandas as pd
+
+matplotlib.use("Agg")  # file-only backend: no display needed (WSL, Prefect workers)
+import matplotlib.dates as mdates  # noqa: E402  (must come after matplotlib.use)
+import matplotlib.pyplot as plt  # noqa: E402
 from pandas.errors import Pandas4Warning
 from prefect import flow, get_run_logger, task
 from prefect.cache_policies import NO_CACHE
@@ -46,6 +51,14 @@ BASE_DIR = Path(__file__).resolve().parent
 RAW_DIR = BASE_DIR / "data" / "raw"
 LOG_DIR = BASE_DIR / "logs"
 PLOTS_DIR = BASE_DIR / "plots"
+# Task 6: one fixed color per repo in every plot (Okabe-Ito, colorblind-safe). Keyed by repo name,
+# not rank, so a repo keeps its color even if the ranking changes.
+REPO_COLORS = {
+    "scikit-learn/scikit-learn": "#E69F00",  # orange
+    "dask/dask": "#0072B2",                  # blue
+    "plotly/plotly.py": "#009E73",           # green
+}
+PLOT_DPI = 150
 DB_PATH = BASE_DIR / "packages.duckdb"
 DBT_DIR = BASE_DIR  # dbt_project.yml and profiles.yml live at the repo root
 
@@ -852,8 +865,11 @@ def _rank(z: pd.DataFrame, weights: dict) -> pd.DataFrame:
     return ranked.sort_values("rank")
 
 
-def _weight_sensitivity(z: pd.DataFrame, log: TaskLog) -> dict:
-    """Log the ranking under the chosen weights, equal weights, and each dimension dropped in turn."""
+def _weight_sensitivity(z: pd.DataFrame, log: TaskLog) -> tuple[dict, int, int]:
+    """Log the ranking under the chosen weights, equal weights, and each dimension dropped in turn.
+
+    Returns (orders per scenario, alternatives where the chosen order holds, number of alternatives).
+    """
     scenarios = {
         "chosen weights": DIMENSION_WEIGHTS,
         "equal weights": {dim: 1 / len(DIMENSION_WEIGHTS) for dim in DIMENSION_WEIGHTS},
@@ -870,8 +886,9 @@ def _weight_sensitivity(z: pd.DataFrame, log: TaskLog) -> dict:
         log.info("  %-24s %s", name,
                  "  >  ".join(f"{repo} ({score:+.2f})" for repo, score in ranked["score"].items()))
     same = sum(order == orders["chosen weights"] for name, order in orders.items() if name != "chosen weights")
-    log.info("The chosen-weights ranking holds in %d of %d alternative scenarios", same, len(orders) - 1)
-    return orders
+    alternatives = len(orders) - 1
+    log.info("The chosen-weights ranking holds in %d of %d alternative scenarios", same, alternatives)
+    return orders, same, alternatives
 
 
 @task(name="5-model")
@@ -889,9 +906,12 @@ def model() -> dict:
                     ranking[["rank", "score", *dims]].round(2), index=True)
         _show_table(log, "Signed z-scores per metric (positive = healthier than the group average):",
                     z.T.round(2), index=True)
-        sensitivity = _weight_sensitivity(z, log)
+        sensitivity, holds, alternatives = _weight_sensitivity(z, log)
 
         out = ranking.reset_index()[["repo", "rank", "score", *dims]]
+        # Run-level facts, repeated on every row, so Task 6 can read them from the database.
+        out["sensitivity_holds"] = holds
+        out["sensitivity_scenarios"] = alternatives
         out["scored_at"] = datetime.now(UTC).replace(tzinfo=None)
         con.register("ranking_df", out)
         con.execute("CREATE OR REPLACE TABLE health_ranking AS SELECT * FROM ranking_df")
@@ -901,11 +921,183 @@ def model() -> dict:
     return {"ranking": out.drop(columns="scored_at").to_dict(orient="records"), "sensitivity": sensitivity}
 
 
+# ---------- Task 6 helpers ----------
+# mart_repo_monthly column -> (panel title, y-axis label with units, log scale?)
+TREND_PANELS = {
+    "commits": ("Commits", "commits / month", False),
+    "prs_opened": ("PRs opened", "opened PRs / month", False),
+    "prs_merged": ("PRs merged", "merged PRs / month", False),
+    "merge_ratio": ("Merge ratio", "merged ÷ (merged + closed unmerged)", False),
+    "active_contributors": ("Active contributors", "non-bot PR authors / month", False),
+    "median_first_review_hours": ("Time to first review", "median hours (log scale)", True),
+    "median_merge_hours": ("Time to merge", "median hours (log scale)", True),
+}
+
+
+def _load_plot_data(con) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Read the two plot sources: the ranking (healthiest first) and complete months only.
+
+    The run month is dropped because it is only partly observed. month::DATE (in the UTC
+    session set by _connect_db) avoids month labels shifting to the last day of the prior month.
+    """
+    ranking = con.execute("SELECT * FROM health_ranking ORDER BY rank").df()
+    monthly = con.execute(f"""
+        SELECT repo, month::DATE AS month, {", ".join(TREND_PANELS)}
+        FROM mart_repo_monthly
+        WHERE NOT is_partial_month
+        ORDER BY repo, month
+    """).df()
+    monthly["month"] = pd.to_datetime(monthly["month"])
+    return ranking, monthly
+
+
+def _check_repo_colors(repos) -> None:
+    """Raise if a repo has no assigned color; otherwise matplotlib would silently pick one."""
+    missing = sorted(set(repos) - set(REPO_COLORS))
+    if missing:
+        raise ValueError(f"Invalid Task 6 config: no REPO_COLORS entry for {missing}")
+
+
+def _short(repo: str) -> str:
+    return repo.split("/")[1]
+
+
+def _rank_labels(ranking: pd.DataFrame) -> dict:
+    """repo -> '#1 scikit-learn', so every legend shows the ranking the same way."""
+    return {r.repo: f"#{r.rank} {_short(r.repo)}" for r in ranking.itertuples()}
+
+
+def _save(fig, path: Path) -> Path:
+    fig.savefig(path, dpi=PLOT_DPI, bbox_inches="tight")
+    plt.close(fig)  # free the figure; open figures otherwise accumulate in memory
+    return path
+
+
+def _plot_dimension_profile(ranking: pd.DataFrame, path: Path) -> Path:
+    """Small-multiples bars: one panel per repo in rank order, one bar per scored dimension."""
+    dims = list(DIMENSION_WEIGHTS)
+    limit = ranking[dims].abs().to_numpy().max() * 1.4  # room for the value labels
+    fig, axes = plt.subplots(1, len(ranking), figsize=(15, 4.8), sharex=True, sharey=True)
+
+    for ax, row in zip(axes, ranking.itertuples()):
+        values = [getattr(row, dim) for dim in dims]
+        y = range(len(dims))
+        ax.barh(y, values, color=REPO_COLORS[row.repo])
+        for yi, v in zip(y, values):
+            ax.text(v + (0.04 if v >= 0 else -0.04), yi, f"{v:+.2f}",
+                    va="center", ha="left" if v >= 0 else "right", fontsize=9)
+        ax.axvline(0, color="black", linewidth=0.8)
+        ax.set_xlim(-limit, limit)
+        ax.set_title(f"#{row.rank} {_short(row.repo)}   score {row.score:+.2f}", fontweight="bold")
+        ax.set_xlabel("subscore (mean signed z, σ units; + = healthier)")
+        ax.grid(axis="x", alpha=0.3)
+
+    axes[0].set_yticks(range(len(dims)),
+                       [f"{d.replace('_', ' ')}\n(weight {DIMENSION_WEIGHTS[d]:.2f})" for d in dims])
+    axes[0].invert_yaxis()  # first dimension at the top (shared y, so applies to all panels)
+
+    # Both facts come from health_ranking (written by Task 5), so the subtitle can't go stale.
+    span = ranking["score"].max() - ranking["score"].min()
+    holds, scenarios = ranking[["sensitivity_holds", "sensitivity_scenarios"]].iloc[0]
+    fig.suptitle("Health dimension profile, ordered by final rank (healthiest on the left)",
+                 fontsize=14, y=1.04)
+    fig.text(0.5, 0.97, f"Scores span {span:.2f} (a near tie); this order holds in "
+             f"{holds} of {scenarios} alternative weight scenarios",
+             ha="center", fontsize=10, style="italic")
+    return _save(fig, path)
+
+
+def _plot_monthly_trends(monthly: pd.DataFrame, ranking: pd.DataFrame, path: Path) -> Path:
+    """2x4 small multiples: one panel per monthly metric, one line per repo; 8th slot = legend."""
+    labels = _rank_labels(ranking)
+    fig, axes = plt.subplots(2, 4, figsize=(19, 8), sharex=True)
+    panels = axes.flat
+
+    for ax, (col, (title, ylabel, log_scale)) in zip(panels, TREND_PANELS.items()):
+        for repo in ranking["repo"]:  # rank order, so legend order = ranking
+            d = monthly[monthly["repo"] == repo]
+            ax.plot(d["month"], d[col], color=REPO_COLORS[repo], label=labels[repo],
+                    linewidth=1.6, marker="o", markersize=2.5)  # NULL months leave a gap
+        ax.set_title(title, fontweight="bold")
+        ax.set_ylabel(ylabel)
+        if log_scale:
+            ax.set_yscale("log")
+        if col == "merge_ratio":
+            ax.set_ylim(-0.03, 1.05)  # a share; just below 0 so a month at exactly 0 isn't clipped
+        ax.grid(alpha=0.3)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(ax.xaxis.get_major_locator()))
+    axes[0, 3].tick_params(labelbottom=True)  # the legend slot is below it, so show its dates
+
+    legend_ax = axes[1, 3]
+    legend_ax.axis("off")
+    handles, names = axes[0, 0].get_legend_handles_labels()
+    legend_ax.legend(handles, names, title="Repo (by health rank)", loc="center",
+                     fontsize=12, title_fontsize=12, frameon=False)
+
+    first, last = monthly["month"].min(), monthly["month"].max()
+    fig.suptitle(f"Monthly activity, {first:%b %Y} – {last:%b %Y}", fontsize=14, y=1.02)
+    fig.text(0.5, 0.985, "Complete months only; the partial run month is excluded. x-axis: calendar month.",
+             ha="center", fontsize=10, style="italic")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+def _plot_relationship(monthly: pd.DataFrame, ranking: pd.DataFrame, path: Path,
+                       log: TaskLog) -> Path:
+    """Bubble chart, one bubble per repo-month: x review speed, y merge ratio, size contributors."""
+    labels = _rank_labels(ranking)
+    cols = ["median_first_review_hours", "merge_ratio"]
+    points = monthly.dropna(subset=cols)
+    log.info("Relationship plot: %d repo-months plotted, %d dropped for a NULL %s",
+             len(points), len(monthly) - len(points), " or ".join(cols))
+
+    size_per_author = 6  # marker area (pt^2) per active contributor
+    fig, ax = plt.subplots(figsize=(11, 7))
+    for repo in ranking["repo"]:
+        d = points[points["repo"] == repo]
+        color = REPO_COLORS[repo]
+        ax.scatter(d["median_first_review_hours"], d["merge_ratio"],
+                   s=d["active_contributors"] * size_per_author, color=color, alpha=0.5,
+                   edgecolors=color, linewidths=0.5, label=labels[repo])
+        ax.scatter(d["median_first_review_hours"].median(), d["merge_ratio"].median(),
+                   s=260, marker="D", color=color, edgecolors="black", linewidths=1.5, zorder=3)
+
+    ax.set_xscale("log")
+    ax.set_xlabel("Median hours to first review (log scale)")
+    ax.set_ylabel("Merge ratio  (merged ÷ (merged + closed unmerged))")
+    ax.set_title("Review speed vs. merge ratio per repo-month (bubble area = active contributors)",
+                 fontweight="bold")
+    ax.grid(alpha=0.3, which="both")
+
+    repo_legend = ax.legend(title="Repo (by health rank)", loc="upper left",
+                            bbox_to_anchor=(1.01, 1), markerscale=0.6, frameon=False)
+    for handle in repo_legend.legend_handles:
+        handle.set_sizes([80])  # uniform swatches; the size legend below explains area
+    ax.add_artist(repo_legend)
+    size_handles = [ax.scatter([], [], s=n * size_per_author, color="grey", alpha=0.5) for n in (10, 40, 80)]
+    size_handles.append(ax.scatter([], [], s=120, marker="D", color="white", edgecolors="black", linewidths=1.5))
+    ax.legend(size_handles, ["10 contributors", "40 contributors", "80 contributors", "repo median month"],
+              title="Marker", loc="upper left", bbox_to_anchor=(1.01, 0.6), labelspacing=1.5, frameon=False)
+    return _save(fig, path)
+
+
 @task(name="6-plot")
 def plot() -> dict:
+    """Task 6: three multi-dimensional PNGs in plots/, from health_ranking and mart_repo_monthly."""
     log = TaskLog("plot")
-    log.info("STUB plot: out_dir=%s", PLOTS_DIR.name)
-    return {}
+    PLOTS_DIR.mkdir(exist_ok=True)
+    with _connect_db(log) as con:  # SELECTs only
+        ranking, monthly = _load_plot_data(con)
+    _check_repo_colors(set(ranking["repo"]) | set(monthly["repo"]))
+
+    saved = [
+        _plot_dimension_profile(ranking, PLOTS_DIR / "1_dimension_profile.png"),
+        _plot_monthly_trends(monthly, ranking, PLOTS_DIR / "2_monthly_trends.png"),
+        _plot_relationship(monthly, ranking, PLOTS_DIR / "3_relationship.png", log),
+    ]
+    for path in saved:
+        log.info("Saved %s (%.0f KB)", path.relative_to(BASE_DIR), path.stat().st_size / 1024)
+    return {"plots": [str(p) for p in saved]}
 
 
 # ---------- Flow ----------
