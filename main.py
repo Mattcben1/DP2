@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 import time
 import warnings
 from datetime import UTC, datetime
@@ -14,8 +15,8 @@ import matplotlib
 import pandas as pd
 
 matplotlib.use("Agg")  # file-only backend: no display needed (WSL, Prefect workers)
-import matplotlib.dates as mdates  # noqa: E402  (must come after matplotlib.use)
-import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.dates as mdates  # must come after matplotlib.use
+import matplotlib.pyplot as plt
 from pandas.errors import Pandas4Warning
 from prefect import flow, get_run_logger, task
 from prefect.cache_policies import NO_CACHE
@@ -97,6 +98,16 @@ class TaskLog:
         self.file.error(msg, *args)
 
 
+def _explain_lock(exc: duckdb.IOException, log: TaskLog) -> None:
+    """Log the likely cause when DuckDB can't open the file because it is locked.
+
+    Only adds context; the caller still re-raises, so the task fails either way.
+    """
+    if "lock" in str(exc).lower():
+        log.error("%s is locked: the DuckDB CLI (or another process) may have it open. "
+                  "Close it and rerun.", DB_PATH.name)
+
+
 # ---------- Task 1 helpers: time ----------
 def _iso(ts: datetime) -> str:
     """Format a timestamp the way GitHub does: 2026-01-01T00:00:00Z (UTC)."""
@@ -112,6 +123,43 @@ def _utc_now() -> str:
 # ---------- Task 1 helpers: HTTP ----------
 class TransientHTTPError(Exception):
     """A GitHub failure worth retrying: 5xx, rate limits, network blips, truncated JSON."""
+
+
+class ApiOdometer:
+    """Counts every HTTP request sent to GitHub during one flow run, retries included.
+
+    Hooked into the httpx client (see extract), so each attempt is counted where it is sent;
+    no call site has to remember to count. The lock keeps counts exact if fetching ever runs
+    in parallel threads.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            self.requests = 0
+            self.by_status = {}
+
+    def on_request(self, request: httpx.Request) -> None:
+        with self._lock:
+            self.requests += 1
+
+    def on_response(self, response: httpx.Response) -> None:
+        with self._lock:
+            code = response.status_code
+            self.by_status[code] = self.by_status.get(code, 0) + 1
+
+    def summary(self) -> str:
+        with self._lock:
+            no_response = self.requests - sum(self.by_status.values())  # network errors, timeouts
+            statuses = ", ".join(f"{code}: {n}" for code, n in sorted(self.by_status.items()))
+            return (f"{self.requests} GitHub API requests this flow run "
+                    f"(by status: {statuses or 'none'}; no response: {no_response})")
+
+
+ODOMETER = ApiOdometer()  # one per process; the flow resets it at the start of each run
 
 
 def _retry_if_transient(task, task_run, state) -> bool:
@@ -276,9 +324,7 @@ def _load_watermarks(log: TaskLog) -> dict:
     except duckdb.CatalogException:
         return {}  # database exists but Task 2 has not created _load_state yet
     except duckdb.IOException as exc:
-        if "lock" in str(exc).lower():
-            log.error("%s is locked: the DuckDB CLI (or another process) may have it open. "
-                      "Close it and rerun.", DB_PATH.name)
+        _explain_lock(exc, log)
         raise
     return {(repo, endpoint): _iso(ts) for repo, endpoint, ts in rows if ts is not None}
 
@@ -432,6 +478,8 @@ def _update_load_state(con, endpoint: str, table: str, loaded_at: datetime) -> N
         GROUP BY repo
     """, [endpoint, loaded_at])
 
+
+# ---------- Tasks 1-2 ----------
 @task(name="1-extract")
 def extract() -> dict:
     """Task 1: land every page of commits, pulls, releases, and reviews into data/raw/."""
@@ -448,12 +496,14 @@ def extract() -> dict:
     watermarks = _load_watermarks(log)
     window_start = f"{START_DATE}T00:00:00Z"
     summary = {}
-    with httpx.Client(headers=_github_headers(), timeout=30) as client:
+    odometer_hooks = {"request": [ODOMETER.on_request], "response": [ODOMETER.on_response]}
+    with httpx.Client(headers=_github_headers(), timeout=30, event_hooks=odometer_hooks) as client:
         for repo in REPOS:
             summary[repo] = _extract_repo(client, repo, watermarks, window_start, log)
 
-    requests = sum(c["pages_fetched"] for counts in summary.values() for c in counts.values())
-    log.info("Extract finished: %d API requests this run", requests)
+    pages = sum(c["pages_fetched"] for counts in summary.values() for c in counts.values())
+    log.info("Extract finished: %d pages fetched this run (%d requests sent, retries included)",
+             pages, ODOMETER.requests)
     return summary
 
 
@@ -491,9 +541,7 @@ def load() -> dict:
                 counts[table] = after
             con.execute("COMMIT")
     except duckdb.IOException as exc:
-        if "lock" in str(exc).lower():
-            log.error("%s is locked: the DuckDB CLI (or another process) may have it open. "
-                      "Close it and rerun.", DB_PATH.name)
+        _explain_lock(exc, log)
         raise
 
     (RAW_DIR / "_LOADED").touch()
@@ -501,6 +549,7 @@ def load() -> dict:
     return counts
 
 
+# ---------- Task 3 ----------
 @task(name="3-dbt-build", cache_policy=NO_CACHE)
 def dbt_build() -> dict:
     """Task 3: run `dbt build` (models + tests); fail the flow if any node fails."""
@@ -530,9 +579,9 @@ def dbt_build() -> dict:
     return statuses
 
 
-# ---------- Tasks 4-5 shared helpers ----------
+# ---------- Tasks 4-6 shared helpers ----------
 def _connect_db(log: TaskLog) -> duckdb.DuckDBPyConnection:
-    """Open packages.duckdb for Tasks 4-5, in UTC like dbt's session.
+    """Open packages.duckdb for Tasks 4-6, in UTC like dbt's session.
 
     Not read_only: dbt-duckdb keeps its read-write connection open in this same process, and
     DuckDB refuses a second connection to the same file with a different configuration.
@@ -540,9 +589,7 @@ def _connect_db(log: TaskLog) -> duckdb.DuckDBPyConnection:
     try:
         con = duckdb.connect(str(DB_PATH))
     except duckdb.IOException as exc:
-        if "lock" in str(exc).lower():
-            log.error("%s is locked: the DuckDB CLI (or another process) may have it open. "
-                      "Close it and rerun.", DB_PATH.name)
+        _explain_lock(exc, log)
         raise
     try:
         con.execute("SET TimeZone = 'UTC'")  # same session zone as dbt, so week buckets line up
@@ -977,7 +1024,10 @@ def _plot_dimension_profile(ranking: pd.DataFrame, path: Path) -> Path:
     """Small-multiples bars: one panel per repo in rank order, one bar per scored dimension."""
     dims = list(DIMENSION_WEIGHTS)
     limit = ranking[dims].abs().to_numpy().max() * 1.4  # room for the value labels
-    fig, axes = plt.subplots(1, len(ranking), figsize=(15, 4.8), sharex=True, sharey=True)
+    # squeeze=False: always a 2-D array of axes, even with one repo (DEV_MODE), so zip() works.
+    fig, axes = plt.subplots(1, len(ranking), figsize=(15, 4.8), sharex=True, sharey=True,
+                             squeeze=False)
+    axes = axes[0]  # the single row of panels
 
     for ax, row in zip(axes, ranking.itertuples()):
         values = [getattr(row, dim) for dim in dims]
@@ -988,7 +1038,8 @@ def _plot_dimension_profile(ranking: pd.DataFrame, path: Path) -> Path:
                     va="center", ha="left" if v >= 0 else "right", fontsize=9)
         ax.axvline(0, color="black", linewidth=0.8)
         ax.set_xlim(-limit, limit)
-        ax.set_title(f"#{row.rank} {_short(row.repo)}   score {row.score:+.2f}", fontweight="bold")
+        # 3 decimals: the scores are a near tie, and 2 decimals made two repos look identical
+        ax.set_title(f"#{row.rank} {_short(row.repo)}   score {row.score:+.3f}", fontweight="bold")
         ax.set_xlabel("subscore (mean signed z, σ units; + = healthier)")
         ax.grid(axis="x", alpha=0.3)
 
@@ -1103,18 +1154,20 @@ def plot() -> dict:
 # ---------- Flow ----------
 @flow(name="bxp6yd-package-health-flow")
 def package_health_flow() -> None:
+    log = TaskLog("flow")
+    ODOMETER.reset()
     if DEV_MODE:
-        TaskLog("flow").warning(
-            "DEV_MODE is ON (start=%s, repos=%s). Set DEV_MODE = False before the final run.",
-            START_DATE,
-            REPOS,
-        )
-    extract()
-    load()
-    dbt_build()
-    validate()
-    model()
-    plot()
+        log.warning("DEV_MODE is ON (start=%s, repos=%s). Set DEV_MODE = False before the final run.",
+                    START_DATE, REPOS)
+    try:
+        extract()
+        load()
+        dbt_build()
+        validate()
+        model()
+        plot()
+    finally:  # runs on success, on a failed task, and on Ctrl-C, so every run reports its total
+        log.info("API odometer: %s", ODOMETER.summary())
 
 
 if __name__ == "__main__":
