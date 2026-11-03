@@ -396,7 +396,7 @@ Task 5 re-ranks under equal weights and with each dimension dropped in turn:
 
 | Scenario | 1st | 2nd | 3rd |
 |---|---|---|---|
-| **Chosen weights** | scikit-learn (+0.02) | plotly (−0.00) | dask (−0.02) |
+| **Chosen weights** | scikit-learn (+0.02) | plotly (−0.003) | dask (−0.02) |
 | Equal weights | plotly (+0.07) | dask (+0.06) | scikit-learn (−0.13) |
 | Drop activity trend | dask (+0.45) | scikit-learn (−0.19) | plotly (−0.26) |
 | Drop responsiveness | plotly (+0.36) | dask (−0.08) | scikit-learn (−0.28) |
