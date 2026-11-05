@@ -18,9 +18,10 @@ matplotlib.use("Agg")  # file-only backend: no display needed (WSL, Prefect work
 import matplotlib.dates as mdates  # must come after matplotlib.use
 import matplotlib.pyplot as plt
 from pandas.errors import Pandas4Warning
-from prefect import flow, get_run_logger, task
+from prefect import flow, get_run_logger, task, unmapped
 from prefect.blocks.system import Secret
 from prefect.cache_policies import NO_CACHE
+from prefect.task_runners import ThreadPoolTaskRunner
 from prefect.tasks import exponential_backoff
 from prefect_dbt import PrefectDbtRunner, PrefectDbtSettings
 
@@ -46,7 +47,8 @@ TOKEN_ENV_VAR = "GH_PAT"  # name only; the value is read inside Task 1 and never
 TOKEN_SECRET_BLOCK = "bxp6yd-pat"  # Prefect Secret block: the fallback when GH_PAT is unset (deployed runs)
 API_ROOT = "https://api.github.com"
 PER_PAGE = 100
-RATE_LIMIT_BUFFER = 25  # sleep until reset once this few requests remain
+RATE_LIMIT_BUFFER = 25  # all workers pause until reset once this few requests remain
+EXTRACT_WORKERS = 3  # Task 1: repos fetched in parallel (1 = sequential, same code path)
 OUTLIER_IQR_K = 3.0  # Task 4: weekly-commit bursts above Tukey's "far out" fence, Q3 + 3*IQR
 SLOW_MERGE_DAYS = 180  # Task 4: slow-merge outliers; same 180 days dbt uses for is_stale
 
@@ -81,23 +83,28 @@ def _file_logger(task_name: str) -> logging.Logger:
 
 
 class TaskLog:
-    """Send each message to the Prefect run logger and to logs/<task_name>.log."""
+    """Send each message to the Prefect run logger and to logs/<task_name>.log.
 
-    def __init__(self, task_name: str):
+    With repo set, every message starts with [owner/name], so the interleaved lines of
+    concurrent repo workers can be told apart.
+    """
+
+    def __init__(self, task_name: str, repo: str | None = None):
         self.prefect = get_run_logger()  # must be called inside a running flow/task
         self.file = _file_logger(task_name)
+        self.prefix = f"[{repo}] " if repo else ""
 
     def info(self, msg, *args):
-        self.prefect.info(msg, *args)
-        self.file.info(msg, *args)
+        self.prefect.info(self.prefix + msg, *args)
+        self.file.info(self.prefix + msg, *args)
 
     def warning(self, msg, *args):
-        self.prefect.warning(msg, *args)
-        self.file.warning(msg, *args)
+        self.prefect.warning(self.prefix + msg, *args)
+        self.file.warning(self.prefix + msg, *args)
 
     def error(self, msg, *args):
-        self.prefect.error(msg, *args)
-        self.file.error(msg, *args)
+        self.prefect.error(self.prefix + msg, *args)
+        self.file.error(self.prefix + msg, *args)
 
 
 def _explain_lock(exc: duckdb.IOException, log: TaskLog) -> None:
@@ -131,8 +138,8 @@ class ApiOdometer:
     """Counts every HTTP request sent to GitHub during one flow run, retries included.
 
     Hooked into the httpx client (see extract), so each attempt is counted where it is sent;
-    no call site has to remember to count. The lock keeps counts exact if fetching ever runs
-    in parallel threads.
+    no call site has to remember to count. The lock keeps counts exact while the repo workers
+    send requests from parallel threads.
     """
 
     def __init__(self):
@@ -162,6 +169,83 @@ class ApiOdometer:
 
 
 ODOMETER = ApiOdometer()  # one per process; the flow resets it at the start of each run
+
+
+def _repo_from_url(url: httpx.URL) -> str | None:
+    """owner/name from a /repos/{owner}/{name}/... URL, so a hook can name the repo it serves."""
+    parts = url.path.split("/")  # ["", "repos", owner, name, ...]
+    return "/".join(parts[2:4]) if len(parts) >= 4 and parts[1] == "repos" else None
+
+
+class RateLimiter:
+    """One GitHub rate-limit budget shared by every repo worker, so they all pause together.
+
+    Hooked into the httpx client like the odometer: before_request runs before every request is
+    sent, on_response after every response. Budgets are keyed by GitHub's resource name (the
+    X-RateLimit-Resource header): "core" for REST today. A GraphQL client would add a "graphql"
+    budget automatically; nothing here would change.
+    """
+
+    def __init__(self, buffer: int):
+        self.buffer = buffer
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._budgets = {}  # resource -> {"remaining": int, "reset": epoch seconds}
+            self._pause_until = 0.0  # epoch seconds; every worker waits until then
+
+    @staticmethod
+    def _resource_for(request: httpx.Request) -> str:
+        # Before a response arrives, the URL is all we know: GraphQL has one endpoint.
+        return "graphql" if request.url.path == "/graphql" else "core"
+
+    def pause(self, seconds: float) -> None:
+        """Make every worker wait (secondary rate limit, Retry-After). Never shortens a pause."""
+        with self._lock:
+            self._pause_until = max(self._pause_until, time.time() + seconds)
+
+    def before_request(self, request: httpx.Request) -> None:
+        resource = self._resource_for(request)
+        started_pause = None
+        with self._lock:
+            now = time.time()
+            budget = self._budgets.get(resource)
+            if budget is not None and budget["remaining"] <= self.buffer:
+                # The first worker to see the low budget starts one shared pause until the reset.
+                # Forgetting the budget means the first response after the pause re-seeds it.
+                self._pause_until = max(self._pause_until, budget["reset"] + 5)  # +5 s clock skew
+                del self._budgets[resource]
+                started_pause = budget["remaining"]
+            elif budget is not None:
+                budget["remaining"] -= 1  # reserve this request so parallel workers can't overshoot
+            wait = max(0.0, self._pause_until - now)
+        if started_pause is not None and wait > 0:
+            TaskLog("extract", repo=_repo_from_url(request.url)).warning(
+                "Only %d %s requests left: all workers sleeping %.0f s until the rate limit resets",
+                started_pause, resource, wait)
+        if wait > 0:
+            time.sleep(wait)  # outside the lock, so other workers can reach their own wait
+
+    def on_response(self, response: httpx.Response) -> None:
+        remaining = response.headers.get("X-RateLimit-Remaining")
+        reset = response.headers.get("X-RateLimit-Reset")
+        if remaining is None or reset is None:
+            return
+        resource = response.headers.get("X-RateLimit-Resource", self._resource_for(response.request))
+        remaining, reset = int(remaining), int(reset)
+        with self._lock:
+            budget = self._budgets.get(resource)
+            if budget is None or reset > budget["reset"]:
+                self._budgets[resource] = {"remaining": remaining, "reset": reset}  # new window
+            elif reset == budget["reset"]:
+                # Parallel responses arrive out of order; the budget only shrinks within a window.
+                budget["remaining"] = min(budget["remaining"], remaining)
+            # reset < budget["reset"]: a late response from the previous window, ignored
+
+
+LIMITER = RateLimiter(RATE_LIMIT_BUFFER)  # shared by all repo workers; reset with the odometer
 
 
 def _retry_if_transient(task, task_run, state) -> bool:
@@ -204,12 +288,6 @@ def _url(path: str, **params) -> str:
     return str(httpx.URL(path, params={**params, "per_page": PER_PAGE}))
 
 
-def _sleep_until_reset(reset_epoch: str, log: TaskLog, reason: str) -> None:
-    wait = max(0, int(reset_epoch) - time.time()) + 5  # +5 s margin for clock skew
-    log.warning("%s: sleeping %.0f s until the rate limit resets", reason, wait)
-    time.sleep(wait)
-
-
 @task(
     name="fetch-page",
     retries=4,
@@ -218,9 +296,13 @@ def _sleep_until_reset(reset_epoch: str, log: TaskLog, reason: str) -> None:
     retry_condition_fn=_retry_if_transient,
     cache_policy=NO_CACHE,
 )
-def fetch_page(client: httpx.Client, url: str) -> dict:
-    """GET one page from GitHub. Returns the JSON body and the rel="next" URL (or None)."""
-    log = TaskLog("extract")
+def fetch_page(client: httpx.Client, repo: str, url: str) -> dict:
+    """GET one page from GitHub. Returns the JSON body and the rel="next" URL (or None).
+
+    Waiting for the rate limit happens in LIMITER's request hook, shared by all workers; this
+    task only reports what a failed response means and starts a shared pause where needed.
+    """
+    log = TaskLog("extract", repo=repo)
     try:
         response = client.get(url)
     except httpx.TransportError as exc:
@@ -233,15 +315,17 @@ def fetch_page(client: httpx.Client, url: str) -> dict:
     if status in (403, 429):
         retry_after = response.headers.get("Retry-After")
         if retry_after:
-            log.warning("Secondary rate limit (%s) on %s: waiting %s s", status, url, retry_after)
-            time.sleep(int(retry_after))
+            log.warning("Secondary rate limit (%s) on %s: all workers pausing %s s", status, url, retry_after)
+            LIMITER.pause(int(retry_after))
             raise TransientHTTPError(f"Secondary rate limit on {url}")
         if remaining == "0" and reset:
-            _sleep_until_reset(reset, log, "Primary rate limit exhausted")
+            # LIMITER already recorded remaining=0, so the retry waits for the reset in its hook.
+            log.warning("Primary rate limit exhausted on %s: retry will wait for the reset", url)
             raise TransientHTTPError(f"Primary rate limit on {url}")
         if status == 429 or "secondary rate limit" in response.text.lower():
-            log.warning("Secondary rate limit (%s) on %s with no Retry-After: waiting 60 s", status, url)
-            time.sleep(60)
+            log.warning("Secondary rate limit (%s) on %s with no Retry-After: all workers pausing 60 s",
+                        status, url)
+            LIMITER.pause(60)
             raise TransientHTTPError(f"Secondary rate limit on {url}")
     if status >= 500:
         raise TransientHTTPError(f"GitHub returned {status} for {url}")
@@ -253,9 +337,6 @@ def fetch_page(client: httpx.Client, url: str) -> dict:
         data = response.json()
     except ValueError as exc:
         raise TransientHTTPError(f"Unparseable JSON from {url}") from exc
-
-    if remaining is not None and reset is not None and int(remaining) <= RATE_LIMIT_BUFFER:
-        _sleep_until_reset(reset, log, f"Only {remaining} requests left")
 
     return {"data": data, "next_url": response.links.get("next", {}).get("url")}
 
@@ -309,7 +390,7 @@ def _paginate(client, repo: str, endpoint: str, endpoint_dir: Path, first_url: s
         page += 1
 
     while url:
-        result = fetch_page(client, url)
+        result = fetch_page(client, repo, url)
         doc = {
             "repo": repo,
             "endpoint": endpoint,
@@ -357,12 +438,19 @@ def _review_targets(pulls_dir: Path, window_start: str, cutoff: str) -> list[int
     return sorted(numbers)
 
 
-def _extract_repo(client, repo: str, watermarks: dict, window_start: str, log: TaskLog) -> dict:
+@task(name="extract-repo", task_run_name="extract-{repo}", cache_policy=NO_CACHE)
+def extract_repo(repo: str, client: httpx.Client, watermarks: dict, window_start: str) -> dict:
+    """Land one repo's commits, pulls, releases and reviews. Mapped over REPOS by Task 1.
+
+    Writes only under data/raw/<owner>__<name>/, so parallel repo workers never share a file.
+    NO_CACHE: the httpx client can't be hashed for a cache key, and every run must refetch.
+    """
+    log = TaskLog("extract", repo=repo)
     repo_dir = RAW_DIR / repo.replace("/", "__")
     base = f"{API_ROOT}/repos/{repo}"
     commits_since = watermarks.get((repo, "commits"), window_start)
     pulls_since = watermarks.get((repo, "pulls"), window_start)
-    log.info("%s: commits since %s, PRs updated since %s", repo, commits_since, pulls_since)
+    log.info("commits since %s, PRs updated since %s", commits_since, pulls_since)
 
     counts = {
         "commits": _paginate(client, repo, "commits", repo_dir / "commits",
@@ -375,7 +463,7 @@ def _extract_repo(client, repo: str, watermarks: dict, window_start: str, log: T
     }
 
     targets = _review_targets(repo_dir / "pulls", window_start, pulls_since)
-    log.info("%s: %d PRs need review calls", repo, len(targets))
+    log.info("%d PRs need review calls", len(targets))
     reviews = {"pages_skipped": 0, "pages_fetched": 0, "records": 0}
     for i, number in enumerate(targets, start=1):
         pr_counts = _paginate(client, repo, "reviews", repo_dir / "reviews" / f"pr_{number}",
@@ -383,12 +471,12 @@ def _extract_repo(client, repo: str, watermarks: dict, window_start: str, log: T
         for key in reviews:
             reviews[key] += pr_counts[key]
         if i % 100 == 0:
-            log.info("%s: reviews for %d/%d PRs done", repo, i, len(targets))
+            log.info("reviews for %d/%d PRs done", i, len(targets))
     counts["reviews"] = reviews
 
     for endpoint, c in counts.items():
-        log.info("%s %s: %d records (%d pages fetched, %d pages skipped from disk)",
-                 repo, endpoint, c["records"], c["pages_fetched"], c["pages_skipped"])
+        log.info("%s: %d records (%d pages fetched, %d pages skipped from disk)",
+                 endpoint, c["records"], c["pages_fetched"], c["pages_skipped"])
     return counts
 
 
@@ -508,13 +596,27 @@ def extract() -> dict:
     else:
         log.info("No data/raw yet: first run, fetching the full window")
 
-    watermarks = _load_watermarks(log)
+    watermarks = _load_watermarks(log)  # read once here; the repo workers never touch DuckDB
     window_start = f"{START_DATE}T00:00:00Z"
-    summary = {}
-    odometer_hooks = {"request": [ODOMETER.on_request], "response": [ODOMETER.on_response]}
-    with httpx.Client(headers=_github_headers(log), timeout=30, event_hooks=odometer_hooks) as client:
-        for repo in REPOS:
-            summary[repo] = _extract_repo(client, repo, watermarks, window_start, log)
+    # Limiter before odometer: a request that must wait is counted when it is actually sent.
+    hooks = {"request": [LIMITER.before_request, ODOMETER.on_request],
+             "response": [LIMITER.on_response, ODOMETER.on_response]}
+    with httpx.Client(headers=_github_headers(log), timeout=30, event_hooks=hooks) as client:
+        # One mapped extract-repo run per repo, on the flow's ThreadPoolTaskRunner
+        # (max_workers=EXTRACT_WORKERS). One shared client: one set of hooks, one budget.
+        futures = extract_repo.map(REPOS, client=unmapped(client),
+                                   watermarks=unmapped(watermarks), window_start=unmapped(window_start))
+        futures.wait()  # every repo finishes (and keeps its pages) even if another one fails
+
+    summary, failed = {}, []
+    for repo, future in zip(REPOS, futures):
+        if future.state.is_completed():
+            summary[repo] = future.result()
+        else:
+            failed.append(repo)
+            log.error("[%s] extraction failed: %s", repo, future.state.message)
+    if failed:
+        raise RuntimeError(f"Extraction failed for {', '.join(failed)}; rerun to resume from disk")
 
     pages = sum(c["pages_fetched"] for counts in summary.values() for c in counts.values())
     log.info("Extract finished: %d pages fetched this run (%d requests sent, retries included)",
@@ -1167,10 +1269,12 @@ def plot() -> dict:
 
 
 # ---------- Flow ----------
-@flow(name="bxp6yd-package-health-flow")
+# The task runner only matters for Task 1's mapped extract-repo runs: no other task is submitted.
+@flow(name="bxp6yd-package-health-flow", task_runner=ThreadPoolTaskRunner(max_workers=EXTRACT_WORKERS))
 def package_health_flow() -> None:
     log = TaskLog("flow")
     ODOMETER.reset()
+    LIMITER.reset()
     if DEV_MODE:
         log.warning("DEV_MODE is ON (start=%s, repos=%s). Set DEV_MODE = False before the final run.",
                     START_DATE, REPOS)
