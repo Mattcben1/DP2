@@ -55,13 +55,13 @@ Due: Nov 02, 2026. See the [README](README.md) for full grading criteria.
 - [x] Outlier cutoffs, the records flagged, and whether you kept, capped, or dropped them, and why
 - [x] Each health metric's definition and direction (higher or lower is healthier); at least four metrics across three dimensions
 - [x] Your weights and the reasoning behind them
-- [ ] A one-paragraph interpretation of each plot
+- [x] A one-paragraph interpretation of each plot
 
 ## Extended items (if attempted)
 
-- [ ] **GraphQL:** PR and review ingestion uses GraphQL with cursor pagination; README logs request counts and runtime for REST vs. GraphQL
-- [ ] **Concurrent fetching:** repos are fetched in parallel under a shared rate limiter; README says where this happens in the code
-- [ ] **Scheduled deployment:** monthly Prefect deployment (the 28th); `DEPLOYMENTS.md` shows the deployment command and the log of one manually triggered run
+- [x] **GraphQL:** PR and review ingestion uses GraphQL with cursor pagination; README logs request counts and runtime for REST vs. GraphQL
+- [x] **Concurrent fetching:** repos are fetched in parallel under a shared rate limiter; README says where this happens in the code
+- [x] **Scheduled deployment:** monthly Prefect deployment (the 28th); `DEPLOYMENTS.md` shows the deployment command and the log of one manually triggered run
 - [x] **API odometer:** total requests per flow run is logged, and your count is: 7,311 (full clean-clone run, 2026-11-02)
 
 ## After submission

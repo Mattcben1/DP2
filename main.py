@@ -18,8 +18,10 @@ matplotlib.use("Agg")  # file-only backend: no display needed (WSL, Prefect work
 import matplotlib.dates as mdates  # must come after matplotlib.use
 import matplotlib.pyplot as plt
 from pandas.errors import Pandas4Warning
-from prefect import flow, get_run_logger, task
+from prefect import flow, get_run_logger, task, unmapped
+from prefect.blocks.system import Secret
 from prefect.cache_policies import NO_CACHE
+from prefect.task_runners import ThreadPoolTaskRunner
 from prefect.tasks import exponential_backoff
 from prefect_dbt import PrefectDbtRunner, PrefectDbtSettings
 
@@ -42,9 +44,14 @@ START_DATE = DEV_START_DATE if DEV_MODE else FULL_START_DATE
 REPOS = DEV_REPOS if DEV_MODE else FULL_REPOS
 
 TOKEN_ENV_VAR = "GH_PAT"  # name only; the value is read inside Task 1 and never logged
+TOKEN_SECRET_BLOCK = "bxp6yd-pat"  # Prefect Secret block: the fallback when GH_PAT is unset (deployed runs)
 API_ROOT = "https://api.github.com"
+GRAPHQL_URL = f"{API_ROOT}/graphql"
+INGESTION = "graphql"  # PRs + reviews via "graphql" or "rest"; commits and releases are always REST
+GRAPHQL_REVIEWS_FIRST = 50  # reviews nested per PR; more than this -> follow-up queries for that PR
 PER_PAGE = 100
-RATE_LIMIT_BUFFER = 25  # sleep until reset once this few requests remain
+RATE_LIMIT_BUFFER = 25  # all workers pause until reset once this few requests remain
+EXTRACT_WORKERS = 3  # Task 1: repos fetched in parallel (1 = sequential, same code path)
 OUTLIER_IQR_K = 3.0  # Task 4: weekly-commit bursts above Tukey's "far out" fence, Q3 + 3*IQR
 SLOW_MERGE_DAYS = 180  # Task 4: slow-merge outliers; same 180 days dbt uses for is_stale
 
@@ -79,23 +86,28 @@ def _file_logger(task_name: str) -> logging.Logger:
 
 
 class TaskLog:
-    """Send each message to the Prefect run logger and to logs/<task_name>.log."""
+    """Send each message to the Prefect run logger and to logs/<task_name>.log.
 
-    def __init__(self, task_name: str):
+    With repo set, every message starts with [owner/name], so the interleaved lines of
+    concurrent repo workers can be told apart.
+    """
+
+    def __init__(self, task_name: str, repo: str | None = None):
         self.prefect = get_run_logger()  # must be called inside a running flow/task
         self.file = _file_logger(task_name)
+        self.prefix = f"[{repo}] " if repo else ""
 
     def info(self, msg, *args):
-        self.prefect.info(msg, *args)
-        self.file.info(msg, *args)
+        self.prefect.info(self.prefix + msg, *args)
+        self.file.info(self.prefix + msg, *args)
 
     def warning(self, msg, *args):
-        self.prefect.warning(msg, *args)
-        self.file.warning(msg, *args)
+        self.prefect.warning(self.prefix + msg, *args)
+        self.file.warning(self.prefix + msg, *args)
 
     def error(self, msg, *args):
-        self.prefect.error(msg, *args)
-        self.file.error(msg, *args)
+        self.prefect.error(self.prefix + msg, *args)
+        self.file.error(self.prefix + msg, *args)
 
 
 def _explain_lock(exc: duckdb.IOException, log: TaskLog) -> None:
@@ -129,8 +141,8 @@ class ApiOdometer:
     """Counts every HTTP request sent to GitHub during one flow run, retries included.
 
     Hooked into the httpx client (see extract), so each attempt is counted where it is sent;
-    no call site has to remember to count. The lock keeps counts exact if fetching ever runs
-    in parallel threads.
+    no call site has to remember to count. The lock keeps counts exact while the repo workers
+    send requests from parallel threads.
     """
 
     def __init__(self):
@@ -141,10 +153,13 @@ class ApiOdometer:
         with self._lock:
             self.requests = 0
             self.by_status = {}
+            self.by_resource = {}  # "core" (REST) or "graphql": separate GitHub budgets
 
     def on_request(self, request: httpx.Request) -> None:
+        resource = RateLimiter._resource_for(request)
         with self._lock:
             self.requests += 1
+            self.by_resource[resource] = self.by_resource.get(resource, 0) + 1
 
     def on_response(self, response: httpx.Response) -> None:
         with self._lock:
@@ -155,11 +170,90 @@ class ApiOdometer:
         with self._lock:
             no_response = self.requests - sum(self.by_status.values())  # network errors, timeouts
             statuses = ", ".join(f"{code}: {n}" for code, n in sorted(self.by_status.items()))
+            resources = ", ".join(f"{name}: {n}" for name, n in sorted(self.by_resource.items()))
             return (f"{self.requests} GitHub API requests this flow run "
-                    f"(by status: {statuses or 'none'}; no response: {no_response})")
+                    f"(by resource: {resources or 'none'}; "
+                    f"by status: {statuses or 'none'}; no response: {no_response})")
 
 
 ODOMETER = ApiOdometer()  # one per process; the flow resets it at the start of each run
+
+
+def _repo_from_url(url: httpx.URL) -> str | None:
+    """owner/name from a /repos/{owner}/{name}/... URL, so a hook can name the repo it serves."""
+    parts = url.path.split("/")  # ["", "repos", owner, name, ...]
+    return "/".join(parts[2:4]) if len(parts) >= 4 and parts[1] == "repos" else None
+
+
+class RateLimiter:
+    """One GitHub rate-limit budget shared by every repo worker, so they all pause together.
+
+    Hooked into the httpx client like the odometer: before_request runs before every request is
+    sent, on_response after every response. Budgets are keyed by GitHub's resource name (the
+    X-RateLimit-Resource header): "core" for REST, "graphql" for POST /graphql (budget in points,
+    not requests; our queries cost 1 point each, so reserving 1 per request still fits).
+    """
+
+    def __init__(self, buffer: int):
+        self.buffer = buffer
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._budgets = {}  # resource -> {"remaining": int, "reset": epoch seconds}
+            self._pause_until = 0.0  # epoch seconds; every worker waits until then
+
+    @staticmethod
+    def _resource_for(request: httpx.Request) -> str:
+        # Before a response arrives, the URL is all we know: GraphQL has one endpoint.
+        return "graphql" if request.url.path == "/graphql" else "core"
+
+    def pause(self, seconds: float) -> None:
+        """Make every worker wait (secondary rate limit, Retry-After). Never shortens a pause."""
+        with self._lock:
+            self._pause_until = max(self._pause_until, time.time() + seconds)
+
+    def before_request(self, request: httpx.Request) -> None:
+        resource = self._resource_for(request)
+        started_pause = None
+        with self._lock:
+            now = time.time()
+            budget = self._budgets.get(resource)
+            if budget is not None and budget["remaining"] <= self.buffer:
+                # The first worker to see the low budget starts one shared pause until the reset.
+                # Forgetting the budget means the first response after the pause re-seeds it.
+                self._pause_until = max(self._pause_until, budget["reset"] + 5)  # +5 s clock skew
+                del self._budgets[resource]
+                started_pause = budget["remaining"]
+            elif budget is not None:
+                budget["remaining"] -= 1  # reserve this request so parallel workers can't overshoot
+            wait = max(0.0, self._pause_until - now)
+        if started_pause is not None and wait > 0:
+            TaskLog("extract", repo=_repo_from_url(request.url)).warning(
+                "Only %d %s requests left: all workers sleeping %.0f s until the rate limit resets",
+                started_pause, resource, wait)
+        if wait > 0:
+            time.sleep(wait)  # outside the lock, so other workers can reach their own wait
+
+    def on_response(self, response: httpx.Response) -> None:
+        remaining = response.headers.get("X-RateLimit-Remaining")
+        reset = response.headers.get("X-RateLimit-Reset")
+        if remaining is None or reset is None:
+            return
+        resource = response.headers.get("X-RateLimit-Resource", self._resource_for(response.request))
+        remaining, reset = int(remaining), int(reset)
+        with self._lock:
+            budget = self._budgets.get(resource)
+            if budget is None or reset > budget["reset"]:
+                self._budgets[resource] = {"remaining": remaining, "reset": reset}  # new window
+            elif reset == budget["reset"]:
+                # Parallel responses arrive out of order; the budget only shrinks within a window.
+                budget["remaining"] = min(budget["remaining"], remaining)
+            # reset < budget["reset"]: a late response from the previous window, ignored
+
+
+LIMITER = RateLimiter(RATE_LIMIT_BUFFER)  # shared by all repo workers; reset with the odometer
 
 
 def _retry_if_transient(task, task_run, state) -> bool:
@@ -173,10 +267,23 @@ def _retry_if_transient(task, task_run, state) -> bool:
     return False
 
 
-def _github_headers() -> dict:
+def _github_headers(log: TaskLog | None = None) -> dict:
+    """Request headers with the GitHub token: GH_PAT if set (local runs), else the Secret block.
+
+    Only the token's SOURCE is logged, never its value. log is optional so the headers can be
+    built outside a Prefect run (e.g. a quick check from the shell).
+    """
     token = os.environ.get(TOKEN_ENV_VAR)
+    source = f"environment ({TOKEN_ENV_VAR})"
     if not token:
-        raise RuntimeError(f"Environment variable {TOKEN_ENV_VAR} is not set")
+        try:
+            token = Secret.load(TOKEN_SECRET_BLOCK).get()
+        except Exception as exc:
+            raise RuntimeError(f"{TOKEN_ENV_VAR} is not set and Secret block "
+                               f"'{TOKEN_SECRET_BLOCK}' could not be loaded") from exc
+        source = f"Secret block '{TOKEN_SECRET_BLOCK}'"
+    if log is not None:
+        log.info("GitHub token source: %s", source)
     return {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
@@ -189,12 +296,6 @@ def _url(path: str, **params) -> str:
     return str(httpx.URL(path, params={**params, "per_page": PER_PAGE}))
 
 
-def _sleep_until_reset(reset_epoch: str, log: TaskLog, reason: str) -> None:
-    wait = max(0, int(reset_epoch) - time.time()) + 5  # +5 s margin for clock skew
-    log.warning("%s: sleeping %.0f s until the rate limit resets", reason, wait)
-    time.sleep(wait)
-
-
 @task(
     name="fetch-page",
     retries=4,
@@ -203,14 +304,27 @@ def _sleep_until_reset(reset_epoch: str, log: TaskLog, reason: str) -> None:
     retry_condition_fn=_retry_if_transient,
     cache_policy=NO_CACHE,
 )
-def fetch_page(client: httpx.Client, url: str) -> dict:
-    """GET one page from GitHub. Returns the JSON body and the rel="next" URL (or None)."""
-    log = TaskLog("extract")
+def fetch_page(client: httpx.Client, repo: str, url: str) -> dict:
+    """GET one page from GitHub. Returns the JSON body and the rel="next" URL (or None).
+
+    Waiting for the rate limit happens in LIMITER's request hook, shared by all workers; this
+    task only reports what a failed response means and starts a shared pause where needed.
+    """
+    log = TaskLog("extract", repo=repo)
     try:
         response = client.get(url)
     except httpx.TransportError as exc:
         raise TransientHTTPError(f"Network error for {url}: {exc}") from exc
+    data = _check_response(response, url, log)
+    return {"data": data, "next_url": response.links.get("next", {}).get("url")}
 
+
+def _check_response(response: httpx.Response, url: str, log: TaskLog):
+    """Turn a GitHub HTTP response into its JSON body, or raise. Shared by REST and GraphQL.
+
+    TransientHTTPError (retried): rate limits, 5xx, unparseable JSON. RuntimeError (not
+    retried): any other non-200, e.g. 401 bad token or 404 wrong repo.
+    """
     status = response.status_code
     remaining = response.headers.get("X-RateLimit-Remaining")
     reset = response.headers.get("X-RateLimit-Reset")
@@ -218,15 +332,17 @@ def fetch_page(client: httpx.Client, url: str) -> dict:
     if status in (403, 429):
         retry_after = response.headers.get("Retry-After")
         if retry_after:
-            log.warning("Secondary rate limit (%s) on %s: waiting %s s", status, url, retry_after)
-            time.sleep(int(retry_after))
+            log.warning("Secondary rate limit (%s) on %s: all workers pausing %s s", status, url, retry_after)
+            LIMITER.pause(int(retry_after))
             raise TransientHTTPError(f"Secondary rate limit on {url}")
         if remaining == "0" and reset:
-            _sleep_until_reset(reset, log, "Primary rate limit exhausted")
+            # LIMITER already recorded remaining=0, so the retry waits for the reset in its hook.
+            log.warning("Primary rate limit exhausted on %s: retry will wait for the reset", url)
             raise TransientHTTPError(f"Primary rate limit on {url}")
         if status == 429 or "secondary rate limit" in response.text.lower():
-            log.warning("Secondary rate limit (%s) on %s with no Retry-After: waiting 60 s", status, url)
-            time.sleep(60)
+            log.warning("Secondary rate limit (%s) on %s with no Retry-After: all workers pausing 60 s",
+                        status, url)
+            LIMITER.pause(60)
             raise TransientHTTPError(f"Secondary rate limit on {url}")
     if status >= 500:
         raise TransientHTTPError(f"GitHub returned {status} for {url}")
@@ -235,14 +351,54 @@ def fetch_page(client: httpx.Client, url: str) -> dict:
         raise RuntimeError(f"GitHub returned {status} for {url}")  # retrying won't help
 
     try:
-        data = response.json()
+        return response.json()
     except ValueError as exc:
         raise TransientHTTPError(f"Unparseable JSON from {url}") from exc
 
-    if remaining is not None and reset is not None and int(remaining) <= RATE_LIMIT_BUFFER:
-        _sleep_until_reset(reset, log, f"Only {remaining} requests left")
 
-    return {"data": data, "next_url": response.links.get("next", {}).get("url")}
+# GraphQL "errors" messages that mean GitHub failed on its side (not our query): worth a retry.
+GRAPHQL_TRANSIENT_MESSAGES = ("something went wrong while executing your query", "timeout", "timedout")
+
+
+@task(
+    name="fetch-graphql",
+    retries=4,
+    retry_delay_seconds=exponential_backoff(backoff_factor=10),  # same policy as fetch-page
+    retry_jitter_factor=0.5,
+    retry_condition_fn=_retry_if_transient,
+    cache_policy=NO_CACHE,
+)
+def fetch_graphql(client: httpx.Client, repo: str, label: str, query: str, variables: dict) -> dict:
+    """POST one GraphQL query. Returns its "data" and logs the query's rateLimit block.
+
+    GraphQL reports most failures with HTTP 200 and an "errors" list, so the HTTP checks from
+    _check_response are not enough. Any error means we never land the (partial) data.
+    """
+    log = TaskLog("extract", repo=repo)
+    try:
+        response = client.post(GRAPHQL_URL, json={"query": query, "variables": variables})
+    except httpx.TransportError as exc:
+        raise TransientHTTPError(f"Network error for GraphQL {label}: {exc}") from exc
+    body = _check_response(response, f"GraphQL {label}", log)
+
+    errors = body.get("errors") or []
+    if errors:
+        summary = "; ".join(f"{e.get('type', '?')}: {e.get('message', '')}" for e in errors)[:300]
+        if any(e.get("type") == "RATE_LIMITED" for e in errors):
+            log.warning("GraphQL rate limited on %s: all workers pausing 60 s", label)
+            LIMITER.pause(60)
+            raise TransientHTTPError(f"GraphQL rate limited on {label}")
+        if any(m in e.get("message", "").lower() for e in errors for m in GRAPHQL_TRANSIENT_MESSAGES):
+            log.warning("GraphQL server-side failure on %s (will retry): %s", label, summary)
+            raise TransientHTTPError(f"GraphQL server-side failure on {label}")
+        log.error("GraphQL errors on %s: %s", label, summary)
+        raise RuntimeError(f"GraphQL errors on {label}: {summary}")  # bad query/repo: retrying won't help
+
+    data = body["data"]
+    rate = data.get("rateLimit") or {}
+    log.info("GraphQL %s: cost %s, %s points left, resets %s",
+             label, rate.get("cost"), rate.get("remaining"), rate.get("resetAt"))
+    return data
 
 
 # ---------- Task 1 helpers: landing files ----------
@@ -286,6 +442,7 @@ def _paginate(client, repo: str, endpoint: str, endpoint_dir: Path, first_url: s
         doc = _read_page(_page_path(endpoint_dir, page))
         if doc is None:
             break
+        _check_mode(doc, "next_url", _page_path(endpoint_dir, page))
         counts["pages_skipped"] += 1
         counts["records"] += len(doc["data"])
         url = doc["next_url"]
@@ -294,7 +451,7 @@ def _paginate(client, repo: str, endpoint: str, endpoint_dir: Path, first_url: s
         page += 1
 
     while url:
-        result = fetch_page(client, url)
+        result = fetch_page(client, repo, url)
         doc = {
             "repo": repo,
             "endpoint": endpoint,
@@ -329,51 +486,260 @@ def _load_watermarks(log: TaskLog) -> dict:
     return {(repo, endpoint): _iso(ts) for repo, endpoint, ts in rows if ts is not None}
 
 
+def _needs_reviews(pr: dict, window_start: str, cutoff: str) -> bool:
+    """A PR whose reviews we fetch: created in the window and updated since the cutoff."""
+    return pr["created_at"] >= window_start and pr["updated_at"] >= cutoff
+
+
 def _review_targets(pulls_dir: Path, window_start: str, cutoff: str) -> list[int]:
-    """PR numbers needing review calls: created in the window and updated since the cutoff."""
+    """PR numbers needing review calls, from the landed PR pages."""
     numbers = set()
     for path in sorted(pulls_dir.glob("page_*.json")):
         doc = _read_page(path)
         if doc is None:
             continue
         for pr in doc["data"]:
-            if pr["created_at"] >= window_start and pr["updated_at"] >= cutoff:
+            if _needs_reviews(pr, window_start, cutoff):
                 numbers.add(pr["number"])
     return sorted(numbers)
 
 
-def _extract_repo(client, repo: str, watermarks: dict, window_start: str, log: TaskLog) -> dict:
+def _check_mode(doc: dict, key: str, path: Path) -> None:
+    """Refuse to resume from a page the other INGESTION mode landed (REST: next_url, GraphQL: next_cursor)."""
+    if key not in doc:
+        raise RuntimeError(f"{path} was landed by the other INGESTION mode: "
+                           "delete data/raw or switch INGESTION back, then rerun")
+
+
+# ---------- Task 1 helpers: GraphQL (PRs and reviews) ----------
+# rateLimit is asked for in every query so each page logs its own cost and remaining points.
+PULLS_QUERY = """
+query($owner: String!, $name: String!, $after: String, $reviewsFirst: Int!) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    pullRequests(first: 100, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number state title createdAt updatedAt closedAt mergedAt
+        author { __typename login }
+        reviews(first: $reviewsFirst) {
+          pageInfo { hasNextPage endCursor }
+          nodes { databaseId state submittedAt author { __typename login } }
+        }
+      }
+    }
+  }
+}"""
+
+REVIEWS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $after: String) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviews(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { databaseId state submittedAt author { __typename login } }
+      }
+    }
+  }
+}"""
+
+# GraphQL has a separate MERGED state; REST reports merged PRs as closed (with merged_at set).
+PR_STATES = {"OPEN": "open", "CLOSED": "closed", "MERGED": "closed"}
+
+
+def _rest_user(author: dict | None) -> dict | None:
+    """GraphQL author -> REST user {login, type}. None = deleted account (REST's "ghost")."""
+    if author is None:
+        return None
+    login, kind = author["login"], author["__typename"]  # kind: User, Bot, Organization, Mannequin
+    if kind == "Bot" and not login.endswith("[bot]"):
+        login += "[bot]"  # REST spells bot logins "dependabot[bot]"; GraphQL just "dependabot"
+    return {"login": login, "type": kind}
+
+
+def _rest_pr(node: dict) -> dict:
+    """GraphQL PR node -> the REST /pulls fields stg_pull_requests reads."""
+    return {
+        "number": node["number"],
+        "state": PR_STATES[node["state"]],  # KeyError on a new state: fail loudly, don't guess
+        "title": node["title"],
+        "created_at": node["createdAt"],
+        "updated_at": node["updatedAt"],
+        "closed_at": node["closedAt"],
+        "merged_at": node["mergedAt"],
+        "user": _rest_user(node["author"]),
+    }
+
+
+def _rest_review(node: dict, repo: str, number: int) -> dict:
+    """GraphQL review node -> the REST /reviews fields stg_pr_reviews reads."""
+    return {
+        "id": node["databaseId"],  # the same integer id REST uses
+        "state": node["state"],
+        "submitted_at": node["submittedAt"],
+        "user": _rest_user(node["author"]),
+        "pull_request_url": f"{API_ROOT}/repos/{repo}/pulls/{number}",  # dbt parses the trailing number
+    }
+
+
+def _next_cursor(page_info: dict) -> str | None:
+    return page_info["endCursor"] if page_info["hasNextPage"] else None
+
+
+def _paginate_graphql(client, repo: str, endpoint: str, endpoint_dir: Path, label: str,
+                      query: str, variables: dict, connection, adapt, stop=None, on_nodes=None) -> dict:
+    """Cursor-paginate one GraphQL connection into landing pages. Same shape as _paginate.
+
+    connection(data) picks the connection ({pageInfo, nodes}) out of a response, adapt(node) turns
+    one node into a REST-shaped record, and on_nodes(nodes), if given, runs before the page is
+    written (used to land each PR's nested reviews first). Each page stores the cursor it was
+    fetched with and the next one, so a crashed run resumes from the last page on disk.
+    """
+    counts = {"pages_skipped": 0, "pages_fetched": 0, "records": 0}
+    page = 1
+    cursor = None  # None = first page
+
+    # Resume: walk the pages already on disk and continue from the last one's next_cursor.
+    while True:
+        doc = _read_page(_page_path(endpoint_dir, page))
+        if doc is None:
+            break
+        _check_mode(doc, "next_cursor", _page_path(endpoint_dir, page))
+        counts["pages_skipped"] += 1
+        counts["records"] += len(doc["data"])
+        cursor = doc["next_cursor"]
+        if cursor is None or (stop and stop(doc["data"])):
+            return counts  # this connection was already finished
+        page += 1
+
+    while True:
+        data = fetch_graphql(client, repo, f"{label} page {page}", query, {**variables, "after": cursor})
+        conn = connection(data)
+        records = [adapt(node) for node in conn["nodes"]]
+        next_cursor = _next_cursor(conn["pageInfo"])
+        if on_nodes:
+            on_nodes(conn["nodes"])
+        doc = {
+            "repo": repo,
+            "endpoint": endpoint,
+            "source": "graphql",
+            "query": label,
+            "page": page,
+            "fetched_at": _utc_now(),
+            "cursor": cursor,
+            "next_cursor": next_cursor,
+            "rate_limit": data.get("rateLimit"),
+            "data": records,
+        }
+        _write_page(_page_path(endpoint_dir, page), doc)
+        counts["pages_fetched"] += 1
+        counts["records"] += len(records)
+        if next_cursor is None or (stop and stop(records)):
+            break
+        cursor = next_cursor
+        page += 1
+    return counts
+
+
+def _extract_prs_graphql(client, repo: str, repo_dir: Path, window_start: str, pulls_since: str) -> tuple:
+    """Land PRs and their reviews via GraphQL. Returns (pulls counts, reviews counts).
+
+    Each PR page also brings the first GRAPHQL_REVIEWS_FIRST reviews of every PR on it, so
+    reviews cost no extra requests except for PRs with more reviews than that (follow-ups).
+    """
+    log = TaskLog("extract", repo=repo)
+    owner, name = repo.split("/")
+    reviews_dir = repo_dir / "reviews"
+    nested = set()  # PR numbers whose first review page was landed from a PR page this run
+
+    def land_nested_reviews(nodes):
+        # Written BEFORE the PR page: a PR page on disk guarantees its review pages exist too.
+        for node in nodes:
+            pr = _rest_pr(node)
+            if not _needs_reviews(pr, window_start, pulls_since):  # same targeting as REST
+                continue
+            conn = node["reviews"]
+            _write_page(_page_path(reviews_dir / f"pr_{pr['number']}", 1), {
+                "repo": repo,
+                "endpoint": "reviews",
+                "source": "graphql",
+                "query": "nested in pulls",
+                "page": 1,
+                "fetched_at": _utc_now(),
+                "cursor": None,
+                "next_cursor": _next_cursor(conn["pageInfo"]),
+                "data": [_rest_review(r, repo, pr["number"]) for r in conn["nodes"]],
+            })
+            nested.add(pr["number"])
+
+    pulls = _paginate_graphql(
+        client, repo, "pulls", repo_dir / "pulls", "pulls", PULLS_QUERY,
+        {"owner": owner, "name": name, "reviewsFirst": GRAPHQL_REVIEWS_FIRST},
+        connection=lambda data: data["repository"]["pullRequests"],
+        adapt=_rest_pr, stop=_stop_before(pulls_since), on_nodes=land_nested_reviews)
+
+    # Follow-ups: each targeted PR's review folder already holds page 1 (from disk, so "skipped");
+    # _paginate_graphql only fetches more when that page's next_cursor says there are more.
+    targets = _review_targets(repo_dir / "pulls", window_start, pulls_since)
+    reviews = {"pages_skipped": 0, "pages_fetched": 0, "records": 0}
+    for number in targets:
+        pr_counts = _paginate_graphql(
+            client, repo, "reviews", reviews_dir / f"pr_{number}", f"reviews #{number}", REVIEWS_QUERY,
+            {"owner": owner, "name": name, "number": number},
+            connection=lambda data: data["repository"]["pullRequest"]["reviews"],
+            adapt=lambda node, n=number: _rest_review(node, repo, n))
+        for key in reviews:
+            reviews[key] += pr_counts[key]
+    reviews["pages_skipped"] -= len(nested)  # nested pages came with the PR pages, not from disk
+    log.info("%d PRs need reviews: %d first pages nested in PR pages this run, %d follow-up queries",
+             len(targets), len(nested), reviews["pages_fetched"])
+    return pulls, reviews
+
+
+@task(name="extract-repo", task_run_name="extract-{repo}", cache_policy=NO_CACHE)
+def extract_repo(repo: str, client: httpx.Client, watermarks: dict, window_start: str) -> dict:
+    """Land one repo's commits, pulls, releases and reviews. Mapped over REPOS by Task 1.
+
+    Writes only under data/raw/<owner>__<name>/, so parallel repo workers never share a file.
+    NO_CACHE: the httpx client can't be hashed for a cache key, and every run must refetch.
+    """
+    log = TaskLog("extract", repo=repo)
     repo_dir = RAW_DIR / repo.replace("/", "__")
     base = f"{API_ROOT}/repos/{repo}"
     commits_since = watermarks.get((repo, "commits"), window_start)
     pulls_since = watermarks.get((repo, "pulls"), window_start)
-    log.info("%s: commits since %s, PRs updated since %s", repo, commits_since, pulls_since)
+    log.info("commits since %s, PRs updated since %s", commits_since, pulls_since)
 
     counts = {
         "commits": _paginate(client, repo, "commits", repo_dir / "commits",
                              _url(f"{base}/commits", since=commits_since)),
-        "pulls": _paginate(client, repo, "pulls", repo_dir / "pulls",
-                           _url(f"{base}/pulls", state="all", sort="updated", direction="desc"),
-                           stop=_stop_before(pulls_since)),
         "releases": _paginate(client, repo, "releases", repo_dir / "releases",
                               _url(f"{base}/releases")),
     }
 
-    targets = _review_targets(repo_dir / "pulls", window_start, pulls_since)
-    log.info("%s: %d PRs need review calls", repo, len(targets))
-    reviews = {"pages_skipped": 0, "pages_fetched": 0, "records": 0}
-    for i, number in enumerate(targets, start=1):
-        pr_counts = _paginate(client, repo, "reviews", repo_dir / "reviews" / f"pr_{number}",
-                              _url(f"{base}/pulls/{number}/reviews"))
-        for key in reviews:
-            reviews[key] += pr_counts[key]
-        if i % 100 == 0:
-            log.info("%s: reviews for %d/%d PRs done", repo, i, len(targets))
-    counts["reviews"] = reviews
+    if INGESTION == "graphql":
+        counts["pulls"], counts["reviews"] = _extract_prs_graphql(
+            client, repo, repo_dir, window_start, pulls_since)
+    else:
+        counts["pulls"] = _paginate(client, repo, "pulls", repo_dir / "pulls",
+                                    _url(f"{base}/pulls", state="all", sort="updated", direction="desc"),
+                                    stop=_stop_before(pulls_since))
+        targets = _review_targets(repo_dir / "pulls", window_start, pulls_since)
+        log.info("%d PRs need review calls", len(targets))
+        reviews = {"pages_skipped": 0, "pages_fetched": 0, "records": 0}
+        for i, number in enumerate(targets, start=1):
+            pr_counts = _paginate(client, repo, "reviews", repo_dir / "reviews" / f"pr_{number}",
+                                  _url(f"{base}/pulls/{number}/reviews"))
+            for key in reviews:
+                reviews[key] += pr_counts[key]
+            if i % 100 == 0:
+                log.info("reviews for %d/%d PRs done", i, len(targets))
+        counts["reviews"] = reviews
 
     for endpoint, c in counts.items():
-        log.info("%s %s: %d records (%d pages fetched, %d pages skipped from disk)",
-                 repo, endpoint, c["records"], c["pages_fetched"], c["pages_skipped"])
+        log.info("%s: %d records (%d pages fetched, %d pages skipped from disk)",
+                 endpoint, c["records"], c["pages_fetched"], c["pages_skipped"])
     return counts
 
 
@@ -484,6 +850,9 @@ def _update_load_state(con, endpoint: str, table: str, loaded_at: datetime) -> N
 def extract() -> dict:
     """Task 1: land every page of commits, pulls, releases, and reviews into data/raw/."""
     log = TaskLog("extract")
+    if INGESTION not in ("rest", "graphql"):
+        raise ValueError(f'INGESTION must be "rest" or "graphql", not {INGESTION!r}')
+    log.info("Ingestion mode for PRs and reviews: %s (commits and releases: REST)", INGESTION)
     marker = RAW_DIR / "_LOADED"
     if marker.exists():
         log.info("Found _LOADED: everything on disk is in DuckDB, deleting data/raw and starting fresh")
@@ -493,13 +862,27 @@ def extract() -> dict:
     else:
         log.info("No data/raw yet: first run, fetching the full window")
 
-    watermarks = _load_watermarks(log)
+    watermarks = _load_watermarks(log)  # read once here; the repo workers never touch DuckDB
     window_start = f"{START_DATE}T00:00:00Z"
-    summary = {}
-    odometer_hooks = {"request": [ODOMETER.on_request], "response": [ODOMETER.on_response]}
-    with httpx.Client(headers=_github_headers(), timeout=30, event_hooks=odometer_hooks) as client:
-        for repo in REPOS:
-            summary[repo] = _extract_repo(client, repo, watermarks, window_start, log)
+    # Limiter before odometer: a request that must wait is counted when it is actually sent.
+    hooks = {"request": [LIMITER.before_request, ODOMETER.on_request],
+             "response": [LIMITER.on_response, ODOMETER.on_response]}
+    with httpx.Client(headers=_github_headers(log), timeout=30, event_hooks=hooks) as client:
+        # One mapped extract-repo run per repo, on the flow's ThreadPoolTaskRunner
+        # (max_workers=EXTRACT_WORKERS). One shared client: one set of hooks, one budget.
+        futures = extract_repo.map(REPOS, client=unmapped(client),
+                                   watermarks=unmapped(watermarks), window_start=unmapped(window_start))
+        futures.wait()  # every repo finishes (and keeps its pages) even if another one fails
+
+    summary, failed = {}, []
+    for repo, future in zip(REPOS, futures):
+        if future.state.is_completed():
+            summary[repo] = future.result()
+        else:
+            failed.append(repo)
+            log.error("[%s] extraction failed: %s", repo, future.state.message)
+    if failed:
+        raise RuntimeError(f"Extraction failed for {', '.join(failed)}; rerun to resume from disk")
 
     pages = sum(c["pages_fetched"] for counts in summary.values() for c in counts.values())
     log.info("Extract finished: %d pages fetched this run (%d requests sent, retries included)",
@@ -1152,10 +1535,12 @@ def plot() -> dict:
 
 
 # ---------- Flow ----------
-@flow(name="bxp6yd-package-health-flow")
+# The task runner only matters for Task 1's mapped extract-repo runs: no other task is submitted.
+@flow(name="bxp6yd-package-health-flow", task_runner=ThreadPoolTaskRunner(max_workers=EXTRACT_WORKERS))
 def package_health_flow() -> None:
     log = TaskLog("flow")
     ODOMETER.reset()
+    LIMITER.reset()
     if DEV_MODE:
         log.warning("DEV_MODE is ON (start=%s, repos=%s). Set DEV_MODE = False before the final run.",
                     START_DATE, REPOS)

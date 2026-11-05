@@ -1,114 +1,131 @@
-# Prefect Deployments
+# Prefect Deployment: `bxp6yd-deployment`
 
-All previous in-class examples of Prefect flows have run (executed) on student laptops, while their logging and output has been visible through the SDS Prefect server https://sds-prefect.pods.uvarc.io/.
+## What it does
 
-However, an advanced feature of Prefect is that it can run scheduled or "detached" flows on the server itself. 
+`bxp6yd-deployment` runs the full six-task flow `bxp6yd-package-health-flow` on the SDS Prefect server
+(https://sds-prefect.pods.uvarc.io/) instead of on a laptop:
 
-Here's how to set that up and enable it:
+| Setting | Value |
+| --- | --- |
+| Flow (entrypoint) | `main.py:package_health_flow` |
+| Source | `https://github.com/Mattcben1/DP2.git`, branch `main` (private; cloned with the `bxp6yd-pat` Secret block) |
+| Work pool | `uvasds-k8s-pool` (Kubernetes: each run is a new pod) |
+| Schedule | `Cron("0 0 28 * *", timezone="America/New_York")`: midnight Eastern on the 28th of every month |
+| Job variables | `cpu_request "2"`, `cpu_limit "2"`, `memory_request "2Gi"`, `memory_limit "4Gi"` |
 
-## Blocks / Secrets
+At run time the worker clones the branch and imports `main.py`. Then it runs `package_health_flow()`,
+the same function `python main.py` calls.
 
-1. Keep your entire flow script and all related files in a single repository. You will need the repo URL as part of the deployment.
-2. Any private ENV variables your script depends on (such as your `GH_PAT`) must first be published to the Prefect Server as "Blocks" (i.e. a feature that can store secret variables you can call within your code).
-   1. Go to https://sds-prefect.pods.uvarc.io/v2/blocks
-   2. Select "+ New storage block"
-   3. Select "Secret" (a generic secret), then "Create"
-   4. Give the block a unique **name**, using your computing ID, such as `nem2p-pat` (lowercase letters, numbers, and dashes only). The value should be of the "password" type and contain the actual value of your PAT.
-   5. Click "Save".
-3. To use a Prefect Block within your flow, use this syntax:
+## One-time setup
 
-    ```
-    from prefect.blocks.system import Secret
+1. **Secret block.** `bxp6yd-pat` is a Prefect *Secret* block holding a classic GitHub PAT with the `repo` scope.
+   The `repo` scope is needed because the repository is private. The block is used twice:
+   - the worker uses it to clone the repo (`GitRepository(credentials=...)` in `deploy.py`), and
+   - Task 1 uses it for GitHub API calls when `GH_PAT` is not set (`_github_headers()` in `main.py`).
+2. **Push the branch.** The worker clones `main` from GitHub, so it runs whatever was last pushed.
 
-    my_secret = Secret.load("nem2p-pat")
+## Deployment command
 
-    # Access the stored secret in a reusable object
-    secret = my_secret.get()
-    ```
-
-## Deployments
-
-See the [reference example](https://gist.github.com/nmagee/177f916afefbc7ae5bcfa7e213ca5dd9) for all details and setup, but the crux is found in the `__main__` handler at the bottom:
+From the project root, inside the activated `.venv`:
 
 ```
-if __name__ == "__main__":
-    # runs midnight Eastern on the 28th of every month
-    <flow_function_name>.from_source(
-        source=GIT_URL,
-        entrypoint="main.py:<flow_function_name>",
-    ).deploy(
-        name="package-health",
-        work_pool_name=WORK_POOL,
-        schedule=Cron("0 0 28 * *", timezone="America/New_York"),
-        job_variables={
-            "cpu_request": "2",
-            "cpu_limit": "2",
-            "memory_request": "2Gi",
-            "memory_limit": "4Gi",
-        },
-    )
+python deploy.py
 ```
 
-In the reference example a GitHub Gist repository was used, but any normal GitHub repo will work, using the `https://` prefix with the `.git` suffix.
+`deploy.py`:
 
-### Private repositories
-
-If your repo is private, the Prefect worker needs your PAT to clone it. A PAT with no scopes can only read public repositories, so generate a new one that can also read private repositories, and store it in your Secret block in place of the old one:
-
-1. Go to GitHub → Settings → Developer settings → Personal access tokens → **Tokens (classic)** → "Generate new token (classic)".
-2. Set an expiration that lasts past the end of the semester (60 days).
-3. Check the **`repo`** scope. No other scopes are needed.
-4. Copy the token and update the value of your Secret block (e.g. `nem2p-pat`).
-
-A fine-grained token also works if you prefer narrower access: grant it access to your project repository with **Contents: Read-only** permission.
-
-Instead of passing `GIT_URL` as a plain string, wrap it in a `GitRepository` object and pass your Secret block as the credential:
-
-```
+```python
 from prefect.blocks.system import Secret
 from prefect.runner.storage import GitRepository
+from prefect.schedules import Cron
 
-# be sure to use your PAT block below
+from main import package_health_flow
+
+GIT_URL = "https://github.com/Mattcben1/DP2.git"
+BRANCH = "main"
+ENTRYPOINT = "main.py:package_health_flow"
+DEPLOYMENT_NAME = "bxp6yd-deployment"
+WORK_POOL = "uvasds-k8s-pool"
+TOKEN_SECRET_BLOCK = "bxp6yd-pat"
+SCHEDULE = Cron("0 0 28 * *", timezone="America/New_York")
+JOB_VARIABLES = {"cpu_request": "2", "cpu_limit": "2", "memory_request": "2Gi", "memory_limit": "4Gi"}
+
 if __name__ == "__main__":
-    <flow_function_name>.from_source(
+    package_health_flow.from_source(
         source=GitRepository(
             url=GIT_URL,
-            branch="main",
-            credentials={"access_token": Secret.load("nem2p-pat")},
+            branch=BRANCH,
+            credentials={"access_token": Secret.load(TOKEN_SECRET_BLOCK)},
         ),
-        entrypoint="main.py:<flow_function_name>",
+        entrypoint=ENTRYPOINT,
     ).deploy(
-        ...  # same deploy() arguments as above
+        name=DEPLOYMENT_NAME,
+        work_pool_name=WORK_POOL,
+        schedule=SCHEDULE,
+        job_variables=JOB_VARIABLES,
     )
 ```
 
-Pass the loaded `Secret` block itself, not `Secret.load(...).get()`. The deployment then stores only a reference to the block, and the worker fetches the token at run time, so the PAT is never written into the deployment's configuration.
+The `Secret` block object is passed, not `Secret.load(...).get()`. The deployment therefore stores only a
+reference to the block, and the PAT never appears in the deployment's configuration.
 
-The entrypoint should be the filename+primary flow function name, like this:
+## How the run gets its GitHub token
 
-    main.py:package_health_flow
+`_github_headers()` in `main.py` reads `GH_PAT` from the environment if it is set, as on a laptop.
+If it is not set, as in the deployed pod, it reads the token from `Secret.load("bxp6yd-pat").get()`.
+Task 1 logs which source was used, never the value:
 
-Keep the following values as written above:
+```
+GitHub token source: environment (GH_PAT)              <- local run
+GitHub token source: Secret block 'bxp6yd-pat'         <- deployed run
+```
 
-- `WORK_POOL = "uvasds-k8s-pool"`
-- `job_variables` and its values
+## Dependencies on the worker
 
-To publish your deployment once written (and the entire code including your GIT_URL is correct and its content up-to-date), run this command from your project, pointing at the flow's entrypoint:
+The pool's image, `ghcr.io/uvads/prefect-k8s-worker:3.9.0-python3.12` ("UVA SDS Prefect Kubernetes job image
+(datasci deps)"), already includes everything the flow imports: `prefect 3.9.0`, `prefect-dbt 0.7.25`,
+`dbt-core 1.12.6`, `dbt-duckdb 1.11.0`, `duckdb 2.0.0`, `httpx 0.28.1`, `pandas 3.1.0` and `matplotlib 3.11.2`.
+These versions match `requirements.txt`, except that the image has `dbt-duckdb` 1.11.0 and we pin 1.11.1
+(a patch release). Nothing is installed at run time.
 
-    prefect deploy ./main.py:<flow_function_name> \
-        --name nem2p-deployment \
-        --pool uvasds-k8s-pool
+## What a deployed run can and cannot do
 
-## Test your deployment
+- **Always a full run.** Each run starts in a new pod with no `packages.duckdb`, no `data/raw/` and no
+  `_load_state` watermarks. Task 1 therefore fetches the whole window from 2024-01-01: about 7,300 requests,
+  including waits for the rate limit to reset. Incremental resume (the `_LOADED` marker and watermarks) only
+  helps when the database survives between runs, as it does on a laptop.
+- **Outputs stay in the pod.** `plots/*.png`, `logs/*.log` and `packages.duckdb` are written inside the pod
+  and are deleted with it. The Prefect UI log is the permanent record of a deployed run: every task logs through
+  the Prefect logger, including the ranking table and the API odometer total. In production the plots would be
+  copied to remote storage such as S3.
 
-You should see your deployment listed in https://sds-prefect.pods.uvarc.io/v2/deployments
+## Manual run log
 
-Select it to see details and any previous runs. Use the blue "Run" button in the upper-right to trigger a run, which you can then follow like any other run.
+Triggered once from the "Run" button at https://sds-prefect.pods.uvarc.io/v2/deployments, at 7:59 PM EST on
+Nov 4, 2026 (flow run `expert-piculet`). The shared `uvasds-k8s-pool` worker picked it up at 8:26 PM. The run took
+79 minutes, including one 37-minute wait for the rate limit to reset. It ran commit `c634ad4`, the sequential REST
+extract. The concurrency and GraphQL commits were pushed after it.
 
-**For this project, trigger your deployment manually once.** The first scheduled run may not fall before the due date, so a manual run from the "Run" button is what you submit. Copy its log into `DEPLOYMENTS.md` along with your deployment command.
+The log below is trimmed. Timestamps are UTC. Prefect's "Finished" line doesn't name the task, so each one is shown
+with the task's own last line before it.
 
-See the [NYC-Taxi-Monthly](https://sds-prefect.pods.uvarc.io/v2/deployments/deployment/987975de-1d75-48d3-810e-251d9e077b16?tab=Runs) sample deployment and try running it for yourself.
-
-The savvy BSDS student will recognize that some outputs such as plots will not be available since they are built into the remote environment executing the code. This is okay ;^)
-
-(In production the plots would be copied off to remote storage like S3, etc.)
+```
+2026-11-05 01:26:48 UTC  Worker 'KubernetesWorker 59b8229a-1097-400e-afd7-b4547b8611e4' submitting flow run '6cf9906e-0540-42e4-8bbb-60cc0530c1d7'
+2026-11-05 01:26:58 UTC  Beginning flow run 'expert-piculet' for flow 'bxp6yd-package-health-flow'
+2026-11-05 01:26:58 UTC  GitHub token source: Secret block 'bxp6yd-pat'
+...
+2026-11-05 02:45:10 UTC  Extract finished: 7327 pages fetched this run (7327 requests sent, retries included)
+2026-11-05 02:45:10 UTC  Finished in state Completed()                      <- 1-extract
+2026-11-05 02:45:27 UTC  All files loaded and committed; created data/raw/_LOADED
+2026-11-05 02:45:27 UTC  Finished in state Completed()                      <- 2-load
+2026-11-05 02:45:48 UTC  dbt build finished: {'success': 8, 'pass': 43}
+2026-11-05 02:45:48 UTC  Finished in state Completed()                      <- 3-dbt-build
+2026-11-05 02:45:59 UTC  All completeness checks passed
+2026-11-05 02:45:59 UTC  Finished in state Completed()                      <- 4-validate
+2026-11-05 02:45:59 UTC  Wrote 3 rows to health_ranking
+2026-11-05 02:45:59 UTC  Finished in state Completed()                      <- 5-model
+2026-11-05 02:46:02 UTC  Saved plots/3_relationship.png (149 KB)
+2026-11-05 02:46:02 UTC  Finished in state Completed()                      <- 6-plot
+2026-11-05 02:46:02 UTC  API odometer: 7327 GitHub API requests this flow run (by status: 200: 7327; no response: 0)
+2026-11-05 02:46:02 UTC  Finished in state Completed()                      <- flow run
+```
