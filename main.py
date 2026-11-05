@@ -19,6 +19,7 @@ import matplotlib.dates as mdates  # must come after matplotlib.use
 import matplotlib.pyplot as plt
 from pandas.errors import Pandas4Warning
 from prefect import flow, get_run_logger, task
+from prefect.blocks.system import Secret
 from prefect.cache_policies import NO_CACHE
 from prefect.tasks import exponential_backoff
 from prefect_dbt import PrefectDbtRunner, PrefectDbtSettings
@@ -42,6 +43,7 @@ START_DATE = DEV_START_DATE if DEV_MODE else FULL_START_DATE
 REPOS = DEV_REPOS if DEV_MODE else FULL_REPOS
 
 TOKEN_ENV_VAR = "GH_PAT"  # name only; the value is read inside Task 1 and never logged
+TOKEN_SECRET_BLOCK = "bxp6yd-pat"  # Prefect Secret block: the fallback when GH_PAT is unset (deployed runs)
 API_ROOT = "https://api.github.com"
 PER_PAGE = 100
 RATE_LIMIT_BUFFER = 25  # sleep until reset once this few requests remain
@@ -173,10 +175,23 @@ def _retry_if_transient(task, task_run, state) -> bool:
     return False
 
 
-def _github_headers() -> dict:
+def _github_headers(log: TaskLog | None = None) -> dict:
+    """Request headers with the GitHub token: GH_PAT if set (local runs), else the Secret block.
+
+    Only the token's SOURCE is logged, never its value. log is optional so the headers can be
+    built outside a Prefect run (e.g. a quick check from the shell).
+    """
     token = os.environ.get(TOKEN_ENV_VAR)
+    source = f"environment ({TOKEN_ENV_VAR})"
     if not token:
-        raise RuntimeError(f"Environment variable {TOKEN_ENV_VAR} is not set")
+        try:
+            token = Secret.load(TOKEN_SECRET_BLOCK).get()
+        except Exception as exc:
+            raise RuntimeError(f"{TOKEN_ENV_VAR} is not set and Secret block "
+                               f"'{TOKEN_SECRET_BLOCK}' could not be loaded") from exc
+        source = f"Secret block '{TOKEN_SECRET_BLOCK}'"
+    if log is not None:
+        log.info("GitHub token source: %s", source)
     return {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
@@ -497,7 +512,7 @@ def extract() -> dict:
     window_start = f"{START_DATE}T00:00:00Z"
     summary = {}
     odometer_hooks = {"request": [ODOMETER.on_request], "response": [ODOMETER.on_response]}
-    with httpx.Client(headers=_github_headers(), timeout=30, event_hooks=odometer_hooks) as client:
+    with httpx.Client(headers=_github_headers(log), timeout=30, event_hooks=odometer_hooks) as client:
         for repo in REPOS:
             summary[repo] = _extract_repo(client, repo, watermarks, window_start, log)
 
