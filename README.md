@@ -11,7 +11,7 @@ The submission checklist is in [CHECKLIST.md](CHECKLIST.md).
 
 | # | Task | What it does | Output |
 |---|---|---|---|
-| 1 | `1-extract` | Pulls commits, pull requests, PR reviews and releases from the GitHub REST API | `data/raw/<owner>__<repo>/<endpoint>/page_NNNN.json` |
+| 1 | `1-extract` | Pulls commits and releases from the GitHub REST API, and pull requests and PR reviews from the GraphQL API | `data/raw/<owner>__<repo>/<endpoint>/page_NNNN.json` |
 | 2 | `2-load` | Upserts every landed record into one raw table per endpoint | `packages.duckdb` (`raw_*`, `_load_state`) |
 | 3 | `3-dbt-build` | Runs `dbt build`: 4 staging models, 2 fact models, 2 marts, plus tests | staging/fact/mart tables |
 | 4 | `4-validate` | Python checks from files to raw to staging, outlier scan, descriptive statistics | logs only (raises on failure) |
@@ -23,6 +23,13 @@ Repositories (set B): `scikit-learn/scikit-learn`, `dask/dask`, `plotly/plotly.p
 **Result (clean-clone run, 2026-11-02):** scikit-learn ranks 1st (+0.022), plotly.py 2nd (−0.003), dask 3rd (−0.019).
 This is a near tie. The three scores fall within 0.041 of each other on a z-score scale, and the chosen order
 holds in only 2 of 6 alternative weight scenarios. See [Sensitivity](#sensitivity-and-the-near-tie).
+
+**Which run the numbers come from.** Every analysis number in this README (Tasks 2–5: row counts, outliers, descriptive
+statistics, metrics, scores, ranking, sensitivity), the plot captions and the committed `plots/*.png` come from the
+**2026-11-02 clean-clone run**, which used the REST extract. The extended items (GraphQL, concurrency, deployment) were
+added afterwards, and their sections use their own runs. A GraphQL full run on 2026-11-04, two days later, swapped
+places 2 and 3 (dask 2nd at 0.00, plotly 3rd at −0.02): live evidence of the near tie, not an effect of the API change
+(see [GraphQL ingestion](#graphql-ingestion)).
 
 ## Setup and run
 
@@ -40,26 +47,40 @@ python main.py
 
 - **Prefect.** Point Prefect at the course server with `prefect profile use uvasds`, after adding the course profile
   snippet (from Canvas) to `~/.prefect/profiles.toml`. The snippet's auth string is not reproduced here.
-- **Token.** `_github_headers()` reads `GH_PAT` and raises a clear error if it is missing. No token is in the repository.
+- **Token.** `_github_headers()` reads `GH_PAT`. If it is not set, it falls back to the Prefect Secret block
+  `bxp6yd-pat` (used by the deployment), and raises a clear error if neither is available. It logs which source it used,
+  never the value. No token is in the repository.
 - **dbt.** `dbt_project.yml` and `profiles.yml` are at the repo root, and Task 3 passes both as the project and
   profiles directory. You don't need a `~/.dbt` setup.
-- **Dev mode.** `DEV_MODE` at the top of `main.py` (line 34) switches to a 2026-01-01 start and `dask/dask` only.
+- **Dev mode.** `DEV_MODE` at the top of `main.py` switches to a 2026-01-01 start and `dask/dask` only.
   It is `False` for the submitted full run.
+- **Ingestion mode.** `INGESTION = "graphql"` (default) fetches pull requests and reviews through GraphQL;
+  `"rest"` switches back to the REST endpoints. Commits and releases always use REST.
+- **Concurrency.** `EXTRACT_WORKERS = 3` fetches the three repos in parallel; `1` runs them one after another through
+  the same code.
 - **Outputs.** `data/`, `packages.duckdb`, `logs/` and `.venv` are git-ignored. `plots/` is committed.
 
 **Expected runtime**
 
 | Run | Runtime | Evidence |
 |---|---|---|
-| Full run from a clean clone (empty `data/`, no database) | **~1 h 32 min** (17:59:38 → 19:32:06), including one 1,099 s rate-limit sleep | clean-clone run 2026-11-02 |
+| Full run from a clean clone (empty `data/`, no database), `INGESTION = "graphql"` | **~4–5 min** (4 min 18 s logged), no rate-limit wait | full GraphQL run 2026-11-04 |
+| Full run, `INGESTION = "rest"` | **~1.5 h** (1 h 32 min logged, 17:59:38 → 19:32:06), including one 1,099 s rate-limit sleep | clean-clone run 2026-11-02 |
 | Incremental run (database and `_LOADED` present) | **~45 s** (41 s and 44 s logged) | runs 2026-11-02 00:27 and 12:00 |
 
-Most of the full run is the per-PR review calls (7,140 of 7,309 pages) plus waiting for the hourly rate limit to reset.
+In REST mode most of the full run is the per-PR review calls (7,140 of 7,309 pages) plus waiting for the hourly rate
+limit to reset. GraphQL removes those calls, which is why the default full run takes minutes
+(see [GraphQL ingestion](#graphql-ingestion)).
 
 **Logging.** Each task logs through the Prefect logger and to its own file. The files are `logs/extract.log`, `load.log`,
 `dbt_build.log`, `validate.log`, `model.log`, `plot.log` and `flow.log`. dbt's own log is saved as `logs/dbt.log`.
 
 ## Task 1: Extraction
+
+This section describes the REST extract, and its log excerpts come from the REST runs (the 2026-11-02 clean clone and
+the 2026-10-28 interrupted run). With the default `INGESTION = "graphql"`, PRs and reviews come from GraphQL instead,
+with the same landing layout, window rules and resume logic; see [GraphQL ingestion](#graphql-ingestion). Repos are
+fetched in parallel; see [Concurrent fetching](#concurrent-fetching).
 
 **Endpoints** (per repo, all with `per_page=100`):
 
@@ -89,22 +110,28 @@ until there is none. Record and page counts are logged per endpoint per repo. Fr
 2026-11-02 19:29:04,198 | INFO | Extract finished: 7309 pages fetched this run (7311 requests sent, retries included)
 ```
 
-**Primary rate limit.** `fetch_page` reads `X-RateLimit-Remaining` and `X-RateLimit-Reset` on every response. When 25 or fewer
-requests remain (`RATE_LIMIT_BUFFER`), it sleeps until the reset time plus a 5 s margin, so the budget never reaches zero.
-A full run needs more than 5,000 requests, so it always hits this sleep:
+**Primary rate limit.** The shared `RateLimiter` (hooked into the httpx client) reads `X-RateLimit-Remaining` and
+`X-RateLimit-Reset` on every response. When 25 or fewer requests remain (`RATE_LIMIT_BUFFER`), every worker sleeps until
+the reset time plus a 5 s margin, so the budget never reaches zero. A REST full run needs more than 5,000 requests, so it
+always hits this sleep (a GraphQL full run needs about 200 and never does):
 
 ```
 2026-10-28 21:59:28,189 | WARNING | Only 25 requests left: sleeping 1551 s until the rate limit resets
 2026-11-02 18:41:24,984 | WARNING | Only 25 requests left: sleeping 1099 s until the rate limit resets
 ```
 
-The first line is from the 2026-10-28 full run and the second from the clean-clone run.
+The first line is from the 2026-10-28 full run and the second from the clean-clone run. Both predate the shared limiter;
+its warning now reads "Only N core requests left: all workers sleeping ... s".
 
-**Retries and other HTTP errors.** `fetch_page` is its own Prefect task with `retries=4`,
-`retry_delay_seconds=exponential_backoff(backoff_factor=10)` (10, 20, 40, 80 s) and `retry_jitter_factor=0.5`.
-- 403/429 with `Retry-After`: wait that many seconds, then retry.
-- 403 with `Remaining: 0`: sleep until the reset, then retry.
-- 429 or a "secondary rate limit" message without `Retry-After`: wait 60 s, then retry.
+**Retries and other HTTP errors.** `fetch_page` (REST) and `fetch_graphql` are Prefect tasks with `retries=4`,
+`retry_delay_seconds=exponential_backoff(backoff_factor=10)` (10, 20, 40, 80 s) and `retry_jitter_factor=0.5`. Both
+check responses with `_check_response`. Waits go through the shared limiter, so every worker pauses, not just the one
+that got the error:
+- 403/429 with `Retry-After`: all workers pause that many seconds, then retry.
+- 403 with `Remaining: 0`: the retry waits for the reset in the limiter's request hook.
+- 429 or a "secondary rate limit" message without `Retry-After`: all workers pause 60 s, then retry.
+- GraphQL only: GitHub reports most errors with HTTP 200 and an `errors` list. `RATE_LIMITED` pauses 60 s and retries,
+  server-side failures ("something went wrong", timeouts) are retried, anything else raises without a retry.
 - 5xx, network errors (`httpx.TransportError`) and unparseable JSON: raise `TransientHTTPError`, which is retried.
 - Any other status (401, 404, 422): logged with the URL and the start of the response body, then raised as a
   non-retryable `RuntimeError`. `_retry_if_transient` is the `retry_condition_fn`, so retrying never wastes quota on
@@ -122,7 +149,8 @@ showed `fetch-page-e20` going `AwaitingRetry → Retrying` (run count 2) at 19:2
 - Present: everything on disk is already in DuckDB. Task 1 deletes `data/raw/` and fetches only what changed since the
   `_load_state` watermarks.
 - Absent: the previous run stopped early. Task 1 keeps the files, and for each endpoint `_paginate` walks the pages
-  already on disk and continues from the last page's saved `next_url`.
+  already on disk and continues from the last page's saved `next_url` (`_paginate_graphql` does the same with
+  `next_cursor`). Resuming from pages landed in the other `INGESTION` mode is refused (`_check_mode`).
 
 The first full run (2026-10-28) was interrupted with Ctrl-C partway through the scikit-learn reviews:
 
@@ -159,7 +187,9 @@ atomic, so a crash never leaves a truncated `page_NNNN.json`. If a page can't be
 never see a leftover `.tmp` file.
 
 **Landing format, and one deviation.** Each file holds `repo`, `endpoint`, `url`, `page`, `fetched_at` and the unmodified
-`data`, plus `next_url`, which the resume walk uses. Reviews land one folder per PR:
+`data`, plus `next_url`, which the resume walk uses. GraphQL pages hold `data` as REST-shaped records and store
+`source: "graphql"`, the query label, `cursor`, `next_cursor` and the query's `rate_limit` block instead of `url` and
+`next_url`. Reviews land one folder per PR:
 `data/raw/<owner>__<repo>/reviews/pr_<n>/page_0001.json`. This is a deviation from `.../reviews/page_NNNN.json`. Each PR
 has its own paginated reviews endpoint, so each PR's pages start at page 1. A single folder would make page numbers
 collide across PRs. Per-PR folders keep exactly one file per response page, and they let resume skip each PR on its own.
@@ -197,7 +227,8 @@ First load in the clean clone (empty database):
 ```
 
 **Request counts, full vs. incremental.** An incremental run asks for commits `since` the commit watermark, stops PR
-pagination at the PR watermark, and makes review calls only for PRs updated since then.
+pagination at the PR watermark, and makes review calls only for PRs updated since then. The rows up to 2026-11-02 are
+REST runs; the last row is the default GraphQL mode.
 
 | Run | Requests | Source |
 |---|---|---|
@@ -207,6 +238,8 @@ pagination at the PR watermark, and makes review calls only for PRs updated sinc
 | Incremental runs 2026-11-01 | 13, 13, 17, 13 pages | `extract.log` |
 | **Incremental 2026-11-02 00:27** | **17** pages | `extract.log` |
 | **Incremental 2026-11-02 12:00** | **43** requests, all `200` (odometer) | `flow.log` |
+| Full run, deployment `expert-piculet` (2026-11-04, REST, commit `c634ad4`) | 7,327 requests, all `200` (odometer) | DEPLOYMENTS.md |
+| Full run, GraphQL (2026-11-04 21:48) | 208 requests (81 REST + 127 GraphQL), all `200` (odometer) | `flow.log` |
 
 ## Task 3: dbt
 
@@ -423,33 +456,194 @@ All three plots use the same color for each repo (`REPO_COLORS`) and order repos
 
 ![Dimension profile](plots/1_dimension_profile.png)
 
-TODO: final caption
+One panel per repo, ordered by rank, showing the five dimension subscores (signed z: positive = healthier than the
+three-repo average) and each dimension's weight. The totals are within 0.04 of each other, but the profiles differ
+sharply. scikit-learn leads on responsiveness but trails on throughput and backlog. plotly.py has the best activity
+trend and backlog but the slowest first reviews. dask has by far the best throughput, but its activity trend is the
+weakest score on the chart and the main reason it ranks last. Large strengths and weaknesses cancel out, which is why
+this order holds in only 2 of 6 alternative weightings.
 
 ### 2. Monthly trends
 
 ![Monthly trends](plots/2_monthly_trends.png)
 
-TODO: final caption
+Seven measures per repo, month by month from January 2024 to October 2026 (the partial run month is excluded).
+scikit-learn is the largest project throughout. Its active contributors grew from 40–70 a month in 2024 to 80–95 in
+2026, and PRs opened grew with them, but its merge ratio fell from about 0.85 to under 0.5: it merges a smaller share
+of a growing inflow. dask's commits and merges tapered to almost zero over summer 2026, even as PRs opened and
+contributors rose in October, which fits maintainers stepping back. The time panels use a log scale because a few
+months reach hundreds of hours, the same skew that makes the health model use medians.
 
 ### 3. Relationship plot
 
 ![Relationship plot](plots/3_relationship.png)
 
-TODO: final caption
+Each bubble is one repo-month: median hours to first review (log scale) against merge ratio, with bubble area showing
+that month's active contributors. Diamonds mark each repo's median month. scikit-learn forms a tight cluster of large
+bubbles: fast first reviews (mostly 5–30 hours) but lower merge ratios. dask and plotly.py spread across more than two
+orders of magnitude of review time. At the extremes, slow review goes with a low merge ratio (dask's months near 80 and
+380 hours sit around 0.15), but across typical months there is no clear relationship. Months at exactly 1.0 are mostly
+small bubbles, where a handful of PRs decide the ratio.
 
-## Extended: API odometer
+## Extended items
 
-`ApiOdometer` (`main.py`, line 128) counts every HTTP request sent to GitHub during a flow run, retries included, and
-tallies responses by status code:
-- **Where it counts.** It is attached as httpx `event_hooks` on the single client in `extract()` (`main.py`, line 499).
-  Every attempt is counted where it is sent, so no call site has to remember to count. A lock keeps the count exact if
-  fetching ever runs in threads.
-- **Where it reports.** The flow resets it at the start of each run and logs the total in a `finally` block
-  (`main.py`, line 1169), so successful, failed and interrupted runs all report to `logs/flow.log`.
+All four extended items were attempted. Each subsection says what it does, where it lives, and the evidence.
+
+### GraphQL ingestion
+
+**What it does.** With `INGESTION = "graphql"` (the default), pull requests and PR reviews come from the GraphQL API
+with cursor pagination (`pageInfo { hasNextPage endCursor }`). Commits and releases stay on REST. Each PR page
+(100 PRs) also brings the first 50 reviews of every PR on it (`GRAPHQL_REVIEWS_FIRST`), so reviews cost no extra
+requests. Only PRs with more than 50 reviews need follow-up queries for the rest. Every query asks for its own
+`rateLimit { cost remaining resetAt }`, and each page logs it.
+
+**Where it lives.** `extract_repo` picks the mode. `_extract_prs_graphql` lands the PR pages and their nested reviews
+and runs the follow-ups. `_paginate_graphql` follows the cursors and resumes from disk like `_paginate`. `fetch_graphql`
+sends one query, logs its cost, and handles GraphQL's `errors` list. The queries are `PULLS_QUERY` and `REVIEWS_QUERY`.
+
+**REST-shaped adapter design.** `_rest_pr`, `_rest_review` and `_rest_user` turn each GraphQL node into the REST fields
+the staging models read. Pages land in the same folders with the same layout, so Task 2, the dbt models, Task 4 and
+Task 5 run unchanged in either mode, and the two modes can be compared row for row. The mapping:
+- GraphQL `MERGED` → REST `closed` (REST reports merged PRs as closed, with `merged_at` set). An unknown state raises
+  instead of guessing.
+- Review `databaseId` → `id`, the same integer REST uses, so keys match across APIs.
+- Author `__typename` → `user.type`. Bot logins get REST's `[bot]` suffix (GraphQL says `dependabot`, REST says
+  `dependabot[bot]`), so the bot rule works unchanged. A deleted account is `None`, as REST's ghost user is.
+- `pull_request_url` is rebuilt, because dbt reads the PR number from its end.
+- Reviews are written before their PR page, so a PR page on disk guarantees its first review page exists for resume.
+
+**Full window: REST vs. GraphQL** (2024-01-01 to the run time, all three repos, empty `data/` and database):
+
+| Full run | PRs and reviews via | Requests (odometer) | Runtime | Evidence |
+|---|---|---|---|---|
+| Clean clone, 2026-11-02 | REST | 7,311 | ~1 h 32 min, including one 1,099 s rate-limit wait | `flow.log` |
+| Deployment `expert-piculet`, 2026-11-04 (commit `c634ad4`) | REST | 7,327 | 79 min, including one ~37 min rate-limit wait (the ~27 min queue in the shared pool is not counted) | DEPLOYMENTS.md |
+| Full run, 2026-11-04 | GraphQL | **208** (core 81, graphql 127) | **4 min 18 s**, no rate-limit wait | `flow.log`, `extract.log` |
+
+- **Cost.** Every GraphQL query logged `cost 1` (134 queries across that day's runs), so 127 queries used 127 of the
+  5,000 points per hour.
+- **The 127 GraphQL requests** are 88 PR pages plus **39 review follow-ups** (scikit-learn 35, plotly 4, dask 0).
+- **Why REST needs so many.** REST makes one review call per PR (about 7,140 of the 7,309 pages on Nov 2). That pushes
+  a full run past 5,000 requests and into the hourly reset. The two REST runs differ by 16 requests because the repos
+  gained PRs between Nov 2 and Nov 4.
+
+```
+2026-11-04 21:45:22,065 | INFO | [plotly/plotly.py] 690 PRs need reviews: 690 first pages nested in PR pages this run, 4 follow-up queries
+2026-11-04 21:45:25,548 | INFO | [dask/dask] 1233 PRs need reviews: 1233 first pages nested in PR pages this run, 0 follow-up queries
+2026-11-04 21:48:00,948 | INFO | [scikit-learn/scikit-learn] 5229 PRs need reviews: 5229 first pages nested in PR pages this run, 35 follow-up queries
+2026-11-04 21:48:01,042 | INFO | Extract finished: 208 pages fetched this run (208 requests sent, retries included)
+2026-11-04 21:48:49,547 | INFO | API odometer: 208 GitHub API requests this flow run (by resource: core: 81, graphql: 127; by status: 200: 208; no response: 0)
+```
+
+**Short-window fidelity check** (start 2026-10-01, all three repos, each mode run from empty):
+
+| | REST | GraphQL |
+|---|---|---|
+| Requests | 358 (all core) | 15 (core 8, graphql 7) |
+| `raw_commits` / `raw_pull_requests` / `raw_pr_reviews` / `raw_releases` | 237 / 700 / 371 / 204 | identical |
+| dbt / Task 4 | PASS=51, pass | PASS=51, pass |
+
+The REST database was kept and compared with the GraphQL one row by row:
+- **Reviews:** all 371 are identical, field by field, logins included.
+- **PRs:** identical except for two explained differences. First, one PR was opened between the two runs and pushed
+  another off dask's single 100-PR page. Second, the Copilot login below.
+- **The Copilot login.** Two PRs opened by GitHub's Copilot agent have author `Copilot` in REST but
+  `copilot-swe-agent[bot]` in GraphQL. GitHub names that account differently in its two APIs. It is a bot in both, so
+  `is_bot` and every metric are unchanged.
+
+The short-window REST runtime isn't comparable: core had only about 20 requests left when that run started, so it slept
+until the reset. The full-run runtimes in the table above are the fair comparison.
+
+**The Nov 4 ranking.** The GraphQL full run ranked scikit-learn 1st (+0.01), dask 2nd (0.00) and plotly 3rd (−0.02),
+swapping places 2 and 3 compared with Nov 2. It had two more days of data (7,566 commits and 21,921 reviews against
+7,549 and 21,873 in the Nov 2 clean clone), and the fidelity check shows both APIs land the same records. So the swap is
+new data on a near tie, not the API. The README's analysis stays on the Nov 2 run so every number comes from one run.
+
+### Concurrent fetching
+
+**What it does.** Task 1 fetches the three repos at the same time, at most `EXTRACT_WORKERS = 3` at once. All workers
+share one httpx client and one rate-limit budget, so they pause together and can't overshoot the limit between them.
+
+**Where it lives.**
+- **Prefect task mapping inside `1-extract`.** `extract()` calls `extract_repo.map(REPOS, ...)`, with the client,
+  watermarks and window start passed as `unmapped`. Each repo is one `extract-{repo}` task run, nested under `1-extract`
+  in the Prefect UI. The flow's `ThreadPoolTaskRunner(max_workers=EXTRACT_WORKERS)` caps how many run at once. The six
+  top-level tasks are still called in order.
+- **No shared files.** `extract_repo` writes only under `data/raw/<owner>__<name>/`, so workers never touch the same file.
+  Watermarks are read from DuckDB once, before the workers start.
+- **Failures.** `extract()` waits for every repo, so one repo failing doesn't throw away the others' pages. It then raises,
+  naming the failed repos, and a rerun resumes from disk.
+- **Shared rate limiter.** `RateLimiter` is attached as an httpx event hook (`before_request`, `on_response`) on the
+  shared client. Under a lock it keeps one budget per GitHub resource (`core`, `graphql`) and reserves one request each
+  time a request is sent, so parallel workers can't all spend the last few requests. When 25 or fewer remain, the first
+  worker to notice starts one shared pause until the reset and all workers wait. Responses that arrive out of order
+  can only lower the budget within a window; late responses from the previous window are ignored. `LIMITER.pause()`
+  serves `Retry-After` and secondary limits for all workers.
+- **Log lines.** Every repo line in `logs/extract.log` starts with `[owner/name]`, because the repos' lines interleave.
+
+**Evidence** (short window, start 2026-10-01, all three repos, each run from empty):
+
+| | Sequential (`EXTRACT_WORKERS = 1`) | Concurrent (`= 3`) |
+|---|---|---|
+| Task 1 (extract) | 111.5 s | **70.4 s** |
+| Whole flow | 123.8 s | 84.6 s |
+| Requests / pages | 358 / 358 | 358 / 358 |
+| Rows loaded, dbt, Task 4 | 237 / 700 / 371 / 204, PASS=51, pass | identical |
+
+**Why only 1.6× faster.** The run can't finish before its slowest repo. scikit-learn has the most work (202 review pages,
+about 70 s on its own); dask and plotly finished at 22 s and 25 s, running alongside it. Concurrency saves the time of
+the smaller repos, not scikit-learn's.
+
+**Offline limiter test.** A one-off script (outside the repository) fed `RateLimiter` fake responses, with no network
+calls. Final run, 4/4 checks passed:
+- 26 requests left, then 25: the next request waits until the reset plus 5 s.
+- Three threads that hit the low budget at once share one pause and one warning, and wake together.
+- A response with an older reset time is ignored.
+- `pause(2)` blocks every thread for 2 s.
+
+An earlier run failed the shared-pause check by 2.45 s. That was the WSL2 wall clock jumping forward, not the limiter,
+so the test now measures with `time.monotonic()`.
+
+### Scheduled deployment
+
+**What it does.** `bxp6yd-deployment` runs the full flow on the SDS Prefect server, on the `uvasds-k8s-pool`
+Kubernetes work pool, on a monthly schedule: `Cron("0 0 28 * *", timezone="America/New_York")`, midnight Eastern on
+the 28th.
+
+**Where it lives.** `deploy.py` (`package_health_flow.from_source(...).deploy(...)`, cloning the private repo with the
+Secret block as credentials). The token: `_github_headers()` uses `GH_PAT` when it is set and otherwise loads the
+Prefect Secret block `bxp6yd-pat`, which is what the deployed pod does. The deployment stores only a reference to the
+block, so the token never appears in its configuration.
+
+**Evidence.** [DEPLOYMENTS.md](DEPLOYMENTS.md) has the deployment command, the settings, and the log of one manually
+triggered run (`expert-piculet`, 2026-11-04). It used commit `c634ad4` (sequential REST, before the concurrency and GraphQL
+commits). It waited about 27 minutes in the shared pool's queue, then ran for 79 minutes, about 37 of them one
+rate-limit wait. The odometer recorded 7,327 requests, all 200, and the log shows
+`GitHub token source: Secret block 'bxp6yd-pat'`.
+
+### API odometer
+
+`ApiOdometer` counts every HTTP request sent to GitHub during a flow run, retries included, and tallies them by
+resource and responses by status code:
+- **Where it counts.** `ODOMETER.on_request` and `on_response` are httpx `event_hooks` on the one shared client in
+  `extract()`. Every attempt is counted where it is sent, so no call site has to remember to count. A lock keeps the
+  count exact while the repo workers send requests from parallel threads.
+- **By resource.** Each request is counted as `core` (REST) or `graphql` (`POST /graphql`). GitHub budgets the two
+  separately, so the split shows which budget a run used.
+- **Where it reports.** `package_health_flow` resets it at the start of each run and logs the total in a `finally`
+  block, so successful, failed and interrupted runs all report to `logs/flow.log`.
 - **No-response count.** Requests sent minus responses received gives the network errors and timeouts.
+
+Full REST run, clean clone (2026-11-02, before the split by resource was added):
 
 ```
 2026-11-02 19:32:06,112 | INFO | API odometer: 7311 GitHub API requests this flow run (by status: 200: 7309; no response: 2)
+```
+
+Full GraphQL run (2026-11-04):
+
+```
+2026-11-04 21:48:49,547 | INFO | API odometer: 208 GitHub API requests this flow run (by resource: core: 81, graphql: 127; by status: 200: 208; no response: 0)
 ```
 
 Incremental run for comparison (2026-11-02 12:00):
@@ -458,6 +652,5 @@ Incremental run for comparison (2026-11-02 12:00):
 2026-11-02 12:00:52,013 | INFO | API odometer: 43 GitHub API requests this flow run (by status: 200: 43; no response: 0)
 ```
 
-**Full-run total: 7,311 requests.**
-
-Not attempted: GraphQL ingestion, concurrent fetching, scheduled deployment.
+**Full-run total (submitted code, final clean-clone run): TODO requests.** The REST totals (7,311 and 7,327) are in
+the comparison table under [GraphQL ingestion](#graphql-ingestion).
