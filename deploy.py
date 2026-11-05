@@ -10,7 +10,7 @@ from prefect.schedules import Cron
 from main import package_health_flow
 
 GIT_URL = "https://github.com/Mattcben1/DP2.git"
-BRANCH = "extras"  # the worker clones this branch, so it must be pushed before a run
+BRANCH = "main"  # the worker clones this branch, so it must be pushed before a run
 ENTRYPOINT = "main.py:package_health_flow"
 DEPLOYMENT_NAME = "bxp6yd-deployment"
 WORK_POOL = "uvasds-k8s-pool"
