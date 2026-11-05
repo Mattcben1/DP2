@@ -91,8 +91,9 @@ These versions match `requirements.txt`, except that the image has `dbt-duckdb` 
 ## What a deployed run can and cannot do
 
 - **Always a full run.** Each run starts in a new pod with no `packages.duckdb`, no `data/raw/` and no
-  `_load_state` watermarks. Task 1 therefore fetches the whole window from 2024-01-01: about 7,300 requests,
-  including waits for the rate limit to reset. Incremental resume (the `_LOADED` marker and watermarks) only
+  `_load_state` watermarks. Task 1 therefore fetches the whole window from 2024-01-01. A deployed run now uses
+  GraphQL: about 200 requests and 4–5 minutes. The logged manual run below used the earlier REST code (7,327
+  requests, 79 minutes). Incremental resume (the `_LOADED` marker and watermarks) only
   helps when the database survives between runs, as it does on a laptop.
 - **Outputs stay in the pod.** `plots/*.png`, `logs/*.log` and `packages.duckdb` are written inside the pod
   and are deleted with it. The Prefect UI log is the permanent record of a deployed run: every task logs through

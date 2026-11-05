@@ -64,7 +64,7 @@ python main.py
 
 | Run | Runtime | Evidence |
 |---|---|---|
-| Full run from a clean clone (empty `data/`, no database), `INGESTION = "graphql"` | **~4–5 min** (4 min 18 s logged), no rate-limit wait | full GraphQL run 2026-11-04 |
+| Full run from a clean clone (empty `data/`, no database), `INGESTION = "graphql"` | **~4–5 min** (4 min 16 s from a clean clone, 2026-11-04 22:23), no rate-limit wait | clean-clone run 2026-11-04 22:23 |
 | Full run, `INGESTION = "rest"` | **~1.5 h** (1 h 32 min logged, 17:59:38 → 19:32:06), including one 1,099 s rate-limit sleep | clean-clone run 2026-11-02 |
 | Incremental run (database and `_LOADED` present) | **~45 s** (41 s and 44 s logged) | runs 2026-11-02 00:27 and 12:00 |
 
@@ -652,5 +652,5 @@ Incremental run for comparison (2026-11-02 12:00):
 2026-11-02 12:00:52,013 | INFO | API odometer: 43 GitHub API requests this flow run (by status: 200: 43; no response: 0)
 ```
 
-**Full-run total (submitted code, final clean-clone run): TODO requests.** The REST totals (7,311 and 7,327) are in
+**Full-run total (submitted code, final clean-clone run, 2026-11-04 22:23): 208 requests (core 81, graphql 127), 4 min 16 s.** The REST totals (7,311 and 7,327) are in
 the comparison table under [GraphQL ingestion](#graphql-ingestion).
